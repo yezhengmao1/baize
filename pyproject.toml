@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "baize"
+version = "0.1.0"
+description = "Analyze NVIDIA Nsight Systems profiles: per-step flame graphs and cross-rank NCCL communication (volume / busbw / skew)."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "matplotlib",
+]
+
+[project.scripts]
+gpu-flame = "nsys_tools.cli:gpu_flame"
+gpu-comm = "nsys_tools.cli:gpu_comm"
+gpu-shape = "nsys_tools.cli:gpu_shape"
+gpu-exporter = "nsys_tools.cli:gpu_exporter"
+gpu-groups = "nsys_tools.cli:gpu_groups"
+
+[tool.setuptools]
+packages = ["nsys_tools", "nsys_tools.tools", "nsys_tools.utils"]
+
+[tool.setuptools.package-data]
+nsys_tools = ["templates/*.html", "templates/*.svg"]

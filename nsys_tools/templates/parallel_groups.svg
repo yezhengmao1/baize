@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="__WIDTH__" height="__HEIGHT__" viewBox="0 0 __WIDTH__ __HEIGHT__">
+  <style>
+    text        { font-family: sans-serif; }
+    .bg         { fill: #ffffff; }
+    .title      { font-size: 19px; font-weight: 700; fill: #111; }
+    .cfg        { font-family: monospace; font-size: 12.5px; fill: #555; }
+    .lg         { font-size: 12.5px; fill: #444; }
+    .nodebox    { fill: #f3f5f7; stroke: #dbe0e5; stroke-width: 1; }
+    .nodelbl    { font-size: 12px; font-weight: 700; fill: #2b2f36; }
+    .stagebox   { fill: #eef2f7; stroke: #d3dbe4; stroke-width: 1; }
+    .stagelbl   { font-size: 11px; font-weight: 700; fill: #4a5666;
+                  text-anchor: middle; letter-spacing: 0.02em; }
+    .rank       { font-family: monospace; font-size: 13px; fill: #1a1a1a; text-anchor: middle; }
+    /* data-shard id, centered in the lower half of each GPU cell */
+    .gnum       { font-family: monospace; font-size: 9px; text-anchor: middle; opacity: 0.9; }
+    /* DP gradient all-reduce: data-flow links between different-data GPUs */
+    .flow       { fill: none; stroke: #37506e; stroke-width: 2.2; stroke-opacity: 0.5;
+                  stroke-linecap: round; }
+    /* EP expert all-to-all (MoE dispatch/combine) within each expert group */
+    .ep         { fill: none; stroke: #c8641e; stroke-width: 1; stroke-opacity: 0.32; }
+    .note       { font-size: 11.5px; fill: #888; }
+  </style>
+  <rect class="bg" width="__WIDTH__" height="__HEIGHT__"/>
+  __CONTENT__
+</svg>

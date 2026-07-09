@@ -1,0 +1,26 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Python packaging / editable-install build artifacts
+*.egg-info/
+build/
+dist/
+
+*.sqlite
+*.nsys-rep
+*.qdrep
+*.qdstrm
+*.hdf
+*.arrow
+*.parquet
+
+# Claude local settings (not shared)
+.claude/settings.local.json
+
+# Local scratch for intermediate outputs (flame graphs, ad-hoc dumps, etc.).
+# Always write generated artifacts under a dot-prefixed path so they stay
+# invisible to `git add` by default.
+.scratch/
+*.folded
+*.html
