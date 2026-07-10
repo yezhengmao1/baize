@@ -188,6 +188,86 @@ def write_html(root: StackNode, out_path: Path, title: str) -> None:
 
 
 # =============================================================================
+# Differential flame graph (compare two stack trees: baseline vs current)
+# =============================================================================
+
+_DIFF_TEMPLATE_PATH = (
+    Path(__file__).resolve().parent.parent / "templates" / "flamegraph_diff.html"
+)
+FLAMEGRAPH_DIFF_HTML_TEMPLATE = _DIFF_TEMPLATE_PATH.read_text()
+
+
+def _diff_tree_to_json(
+    a: "StackNode | None",
+    b: "StackNode | None",
+    scale_a: float,
+    scale_b: float,
+) -> dict:
+    """Merge two aligned stack trees (baseline A, current B) into a diff node.
+
+    Every frame present in either tree appears once, carrying both its baseline
+    (`a`) and current (`b`) additive value (Σ GPU kernel time, scaled per-step so
+    windows covering different step counts stay comparable). The client picks one
+    as `value` per view and colors by the delta `b - a`.
+    """
+    ref = a if a is not None else b
+    assert ref is not None
+    label = frame_tag(ref.name, ref.kind) if ref.kind != "root" else "all"
+    va = a.value * scale_a if a is not None else 0.0
+    vb = b.value * scale_b if b is not None else 0.0
+    node = {"name": label, "kind": ref.kind, "a": va, "b": vb}
+
+    # Union of child keys, preserving first-seen order (A before B).
+    keys: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for src in (a, b):
+        if src is not None:
+            for k in src.children:
+                if k not in seen:
+                    seen.add(k)
+                    keys.append(k)
+
+    if keys:
+        children = [
+            _diff_tree_to_json(
+                a.children.get(k) if a is not None else None,
+                b.children.get(k) if b is not None else None,
+                scale_a,
+                scale_b,
+            )
+            for k in keys
+        ]
+        # Biggest frames (by the larger of the two sides) left-most as a stable
+        # fallback; d3-flame-graph re-sorts by the active view's value anyway.
+        children.sort(key=lambda n: -max(n["a"], n["b"]))
+        node["children"] = children
+    return node
+
+
+def write_diff_html(
+    tree_a: StackNode,
+    tree_b: StackNode,
+    out_path: Path,
+    title: str,
+    label_a: str,
+    label_b: str,
+    scale_a: float,
+    scale_b: float,
+) -> None:
+    """Write the interactive differential flame graph (baseline A vs current B)."""
+    data = json.dumps(
+        _diff_tree_to_json(tree_a, tree_b, scale_a, scale_b), ensure_ascii=False
+    )
+    html = (
+        FLAMEGRAPH_DIFF_HTML_TEMPLATE.replace("__TITLE__", _html_esc(title))
+        .replace("__DATA__", data)
+        .replace("__BEFORE_LABEL__", _html_esc(label_a))
+        .replace("__AFTER_LABEL__", _html_esc(label_b))
+    )
+    out_path.write_text(html)
+
+
+# =============================================================================
 # SQL
 # =============================================================================
 
@@ -369,9 +449,16 @@ def build_flame_tree(
     return tree, gpu_intervals
 
 
+def _resolve_html_path(flamegraph_out: str) -> Path:
+    """Turn a user --flamegraph OUT into the concrete '<OUT>.html' path."""
+    base = Path(flamegraph_out)
+    if base.suffix.lower() in (".html", ".folded"):
+        return base.with_suffix(".html")
+    return Path(str(base) + ".html")
+
+
 def write_report_flamegraph(
     tree: StackNode,
-    idle: int,
     flamegraph_out: str,
     db_path: str,
     rank: int | None,
@@ -381,13 +468,7 @@ def write_report_flamegraph(
     """
     Write the interactive HTML flame graph for the kernel->NVTX stack tree.
     """
-    if idle > 0:
-        tree.add_path([("<idle>", "idle")], idle, idle)
-    base = Path(flamegraph_out)
-    if base.suffix.lower() in (".html", ".folded"):
-        html = base.with_suffix(".html")
-    else:
-        html = Path(str(base) + ".html")
+    html = _resolve_html_path(flamegraph_out)
     title = (
         f"Kernel stack flame graph — {Path(db_path).name}"
         + (f" (rank {rank})" if rank is not None else "")
@@ -397,6 +478,125 @@ def write_report_flamegraph(
     print(
         f"Wrote flame graph: {html}   "
         "(open in browser — click-to-zoom, search, tooltip)"
+    )
+    print()
+
+
+def load_flame_tree(
+    db_path: str,
+    step_nvtx: str,
+    skip_steps: int,
+    stack_depth: int,
+    *,
+    print_steps: bool,
+) -> tuple[StackNode | None, int, int | None]:
+    """Detect steps, build the post-warmup flame tree (with `<idle>` filled in).
+
+    Returns (tree, n_steps, rank). `tree` is None only when the post-warmup
+    window contains no kernels. When `print_steps` is set the per-step window
+    table is printed (the standalone gpu-flame behavior).
+    """
+    conn = open_db(db_path)
+    require_kernel_table(conn, db_path)
+    rank = get_rank(conn)
+
+    idx = NvtxIndex(conn, rank)
+    steps = detect_steps(idx, step_nvtx)
+    if len(steps) <= skip_steps:
+        conn.close()
+        print(
+            f"Error: found {len(steps)} NVTX step markers matching '{step_nvtx}' "
+            f"in {db_path}, cannot skip {skip_steps} and still have any steps left.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    t_min = conn.execute(TRACE_START_SQL).fetchone()[0]
+    step_windows, window_start, window_end = compute_step_windows(
+        steps, t_min, skip_steps
+    )
+    window_dur = window_end - window_start
+
+    if print_steps:
+        print_header_and_steps(
+            db_path, rank, step_nvtx, steps, step_windows, skip_steps, t_min, window_dur
+        )
+
+    tree: StackNode | None = None
+    rows = conn.execute(KERNELS_IN_WINDOW_SQL, (window_start, window_end)).fetchall()
+    if rows:
+        tree, gpu_intervals = build_flame_tree(idx, rows, stack_depth)
+        idle = max(0, window_dur - union_len(gpu_intervals))
+        if idle > 0:
+            tree.add_path([("<idle>", "idle")], idle, idle)
+    conn.close()
+    return tree, len(steps), rank
+
+
+def run_single(args: argparse.Namespace) -> None:
+    """Standard single-profile flow: step table + optional flame graph."""
+    tree, n_steps, rank = load_flame_tree(
+        args.db,
+        args.step_nvtx,
+        args.skip_steps,
+        args.stack_depth,
+        print_steps=True,
+    )
+    if not args.flamegraph:
+        return
+    if tree is None:
+        print("No kernels in post-warmup window.")
+        return
+    write_report_flamegraph(
+        tree, args.flamegraph, args.db, rank, args.skip_steps, n_steps
+    )
+
+
+def run_diff(args: argparse.Namespace) -> None:
+    """Differential flow: build both trees and emit a diff flame graph.
+
+    `args.db` is the current/"after" profile; `args.diff` is the baseline/
+    "before". Values are normalized per post-warmup step so windows spanning
+    different step counts compare fairly; the delta `after - before` colors each
+    frame (red = grew, blue = shrank).
+    """
+    if not args.flamegraph:
+        print(
+            "Error: --diff requires --flamegraph OUT to write the comparison to.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"=== current (after)  : {args.db} ===")
+    tree_b, n_steps_b, _ = load_flame_tree(
+        args.db, args.step_nvtx, args.skip_steps, args.stack_depth, print_steps=True
+    )
+    print(f"=== baseline (before): {args.diff} ===")
+    tree_a, n_steps_a, _ = load_flame_tree(
+        args.diff, args.step_nvtx, args.skip_steps, args.stack_depth, print_steps=True
+    )
+
+    if tree_a is None or tree_b is None:
+        print("No kernels in one of the post-warmup windows — nothing to diff.")
+        return
+
+    steps_a = max(1, n_steps_a - args.skip_steps)
+    steps_b = max(1, n_steps_b - args.skip_steps)
+    scale_a = 1.0 / steps_a
+    scale_b = 1.0 / steps_b
+
+    html = _resolve_html_path(args.flamegraph)
+    label_a = Path(args.diff).name
+    label_b = Path(args.db).name
+    title = f"Differential flame graph — {label_b} vs {label_a} (per-step Σ GPU time)"
+    write_diff_html(tree_a, tree_b, html, title, label_a, label_b, scale_a, scale_b)
+    print(
+        f"Baseline steps/window: {steps_a}   Current steps/window: {steps_b}   "
+        "(values normalized to per-step averages)"
+    )
+    print(
+        f"Wrote diff flame graph: {html}   "
+        "(red = more time now, blue = less; two views = before / after widths)"
     )
     print()
 
@@ -438,6 +638,17 @@ def parse_args() -> argparse.Namespace:
         "from CDN). CPU NVTX frames are cool-colored; GPU kernel leaves are "
         "warm-colored.",
     )
+    p.add_argument(
+        "--diff",
+        default=None,
+        metavar="BASELINE_DB",
+        help="Compare against a baseline profile: emit a differential flame graph "
+        "to '<OUT>.html' (requires --flamegraph). The positional 'db' is the "
+        "current/'after' profile; BASELINE_DB is the 'before'. Values are "
+        "normalized per post-warmup step, and each frame is colored by the delta "
+        "(red = more GPU time now, blue = less). Two views show 'before' and "
+        "'after' widths so removed and added frames are both visible.",
+    )
     args = p.parse_args()
     if args.skip_steps < 0:
         p.error("--skip-steps must be >= 0")
@@ -449,67 +660,15 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
 
-    conn = open_db(args.db)
-    require_kernel_table(conn, args.db)
-    rank = get_rank(conn)
-
     """
     STEP1. Detect step markers and compute the post-warmup analysis window.
     STEP2. Read GPU kernels whose GPU execution interval falls inside that window.
     STEP3. Build the flame tree:
         - Use each kernel's CUDA launch API interval to look up the enclosing CPU-side NVTX stack.
+    STEP4. (--diff) Repeat STEP1-3 for the baseline profile and emit a diff graph.
     """
 
-    idx = NvtxIndex(conn, rank)
-    steps = detect_steps(idx, args.step_nvtx)
-    if len(steps) <= args.skip_steps:
-        conn.close()
-        print(
-            f"Error: found {len(steps)} NVTX step markers matching '{args.step_nvtx}', "
-            f"cannot skip {args.skip_steps} and still have any steps left.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    t_min = conn.execute(TRACE_START_SQL).fetchone()[0]
-    step_windows, window_start, window_end = compute_step_windows(
-        steps,
-        t_min,
-        args.skip_steps,
-    )
-    window_dur = window_end - window_start
-
-    # the step windows is a list of tuples, each with (start, end, name)
-    print_header_and_steps(
-        args.db,
-        rank,
-        args.step_nvtx,
-        steps,
-        step_windows,
-        args.skip_steps,
-        t_min,
-        window_dur,
-    )
-
-    if args.flamegraph:
-        rows = conn.execute(
-            KERNELS_IN_WINDOW_SQL,
-            (window_start, window_end),
-        ).fetchall()
-
-        if not rows:
-            print("No kernels in post-warmup window.")
-        else:
-            tree, gpu_intervals = build_flame_tree(idx, rows, args.stack_depth)
-            idle = max(0, window_dur - union_len(gpu_intervals))
-            write_report_flamegraph(
-                tree,
-                idle,
-                args.flamegraph,
-                args.db,
-                rank,
-                args.skip_steps,
-                len(steps),
-            )
-
-    conn.close()
+    if args.diff:
+        run_diff(args)
+    else:
+        run_single(args)
