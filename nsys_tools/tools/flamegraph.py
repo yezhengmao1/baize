@@ -11,6 +11,7 @@ from pathlib import Path
 
 from ..utils.common import (
     get_rank,
+    has_table,
     human_ns,
     open_db,
     require_kernel_table,
@@ -54,6 +55,15 @@ class StackNode:
             c.value += value
             c.solo_value += solo
             cur = c
+
+    def clone(self) -> "StackNode":
+        """Deep copy — used to build the idle-attributed variant without mutating
+        the pure-activity tree that drives the Sum/Solo charts."""
+        n = StackNode(self.name, self.kind)
+        n.value = self.value
+        n.solo_value = self.solo_value
+        n.children = {k: c.clone() for k, c in self.children.items()}
+        return n
 
 
 def compute_solo_times(intervals: list[tuple[int, int]]) -> list[int]:
@@ -143,20 +153,27 @@ LABELS = {
         "(CPU-side semantic marker; not GPU work)<br>\n"
         '  <span class="sw" style="background:hsl(25,80%,58%)"></span> GPU kernel '
         "leaf (actual SM execution)<br>\n"
+        '  <span class="sw" style="background:hsl(140,58%,46%)"></span> GPU memcpy '
+        "(H2D/D2H/D2D copy) &nbsp; "
+        '<span class="sw" style="background:hsl(275,52%,56%)"></span> GPU memset<br>\n'
         '  <span class="sw" style="background:hsl(320,85%,55%)"></span> GPU idle '
-        "(no kernel running) — bright magenta so it is unmistakable; gray is "
-        "reserved for the <i>overlap</i> encoding in the Sum view\n"
+        "(no GPU activity, attributed to the NVTX scope enclosing the gap) — "
+        "bright magenta so it is unmistakable; gray is reserved for the "
+        "<i>overlap</i> encoding in the Sum view\n"
     ),
     "NOTE": (
-        "\n  Two charts below share the same hierarchy. Identity per node: "
+        "\n  Three charts below share the same hierarchy. Identity per node: "
         "<b>sum = solo + overlap</b>.<br>\n"
-        "  In <b>Sum</b>, widths are total kernel time and color saturation "
-        "encodes overlap "
-        "(vivid = exposed, pale = mostly hidden behind other GPU work).<br>\n"
-        "  In <b>Solo</b>, widths are per-kernel solo time — the portion that "
-        "actually blocks the GPU clock.<br>\n"
-        "  Wide + pale in Sum, narrow in Solo → good concurrency. Wide in both → "
-        "fully exposed, optimization target.<br>\n"
+        "  <b>Solo</b> (non-overlap) — widths are per-activity solo time, the "
+        "portion that actually blocks the GPU clock.<br>\n"
+        "  <b>Sum</b> (overlap) — widths are total GPU-activity time; color "
+        "saturation encodes overlap (vivid = exposed, pale = mostly hidden behind "
+        "other GPU work). Wide + pale here but narrow in Solo → good concurrency; "
+        "wide in both → fully exposed, optimization target.<br>\n"
+        "  <b>Sum + idle</b> — the Sum chart plus GPU-idle gaps added as magenta "
+        "&lt;idle&gt; leaves under the NVTX scope that enclosed each gap, so you "
+        "see which phase the GPU stalled in. Idle appears in this chart only; the "
+        "first two are pure GPU activity.<br>\n"
         "  Tooltip shows absolute sum / solo / overlap%.\n"
     ),
     "VIEW1_H2": (
@@ -176,11 +193,28 @@ LABELS = {
 }
 
 
-def write_html(root: StackNode, out_path: Path, title: str) -> None:
-    """Write the interactive HTML flame graph for the kernel->NVTX stack tree."""
+def write_html(
+    root: StackNode,
+    root_idle: StackNode | None,
+    out_path: Path,
+    title: str,
+) -> None:
+    """Write the interactive HTML flame graph.
+
+    `root` (pure GPU activity) drives the Sum + Solo charts; `root_idle` (same
+    tree with idle added) drives the third "Sum + idle" chart, or `null`/no third
+    chart when there is no idle.
+    """
     data = json.dumps(_tree_to_json(root), ensure_ascii=False)
-    html = FLAMEGRAPH_HTML_TEMPLATE.replace("__TITLE__", _html_esc(title)).replace(
-        "__DATA__", data
+    data_idle = (
+        json.dumps(_tree_to_json(root_idle), ensure_ascii=False)
+        if root_idle is not None
+        else "null"
+    )
+    html = (
+        FLAMEGRAPH_HTML_TEMPLATE.replace("__TITLE__", _html_esc(title))
+        .replace("__DATA_IDLE__", data_idle)
+        .replace("__DATA__", data)
     )
     for key, val in LABELS.items():
         html = html.replace(f"__{key}__", val)
@@ -278,6 +312,45 @@ WHERE k.start >= ? AND k.end <= ?
 ORDER BY r.start
 """
 )
+
+# GPU memory copies / sets: separate CUPTI activity tables (NOT joined by
+# KERNEL_SQL), so they are invisible to a kernel-only tree. Each row joins its
+# launch API (cudaMemcpy*/cudaMemset*) via correlationId so the enclosing NVTX
+# stack resolves through the same mapping as kernels; copyKind → readable label.
+MEMCPY_IN_WINDOW_SQL = """
+SELECT
+    m.start           AS gpu_start,
+    m.end             AS gpu_end,
+    m.end - m.start   AS gpu_dur_ns,
+    CASE m.copyKind
+        WHEN 1  THEN 'Memcpy HtoD'
+        WHEN 2  THEN 'Memcpy DtoH'
+        WHEN 8  THEN 'Memcpy DtoD'
+        WHEN 9  THEN 'Memcpy HtoH'
+        WHEN 10 THEN 'Memcpy PtoP'
+        ELSE 'Memcpy kind=' || m.copyKind
+    END               AS kernel_name,
+    r.start           AS api_start,
+    r.end             AS api_end
+FROM CUPTI_ACTIVITY_KIND_MEMCPY m
+JOIN CUPTI_ACTIVITY_KIND_RUNTIME r ON r.correlationId = m.correlationId
+WHERE m.start >= ? AND m.end <= ?
+ORDER BY r.start
+"""
+
+MEMSET_IN_WINDOW_SQL = """
+SELECT
+    m.start           AS gpu_start,
+    m.end             AS gpu_end,
+    m.end - m.start   AS gpu_dur_ns,
+    'Memset'          AS kernel_name,
+    r.start           AS api_start,
+    r.end             AS api_end
+FROM CUPTI_ACTIVITY_KIND_MEMSET m
+JOIN CUPTI_ACTIVITY_KIND_RUNTIME r ON r.correlationId = m.correlationId
+WHERE m.start >= ? AND m.end <= ?
+ORDER BY r.start
+"""
 
 TRACE_START_SQL = "SELECT MIN(start) FROM CUPTI_ACTIVITY_KIND_KERNEL"
 
@@ -405,15 +478,13 @@ def print_header_and_steps(
     )
 
 
-def build_flame_tree(
-    idx: NvtxIndex,
-    rows,
-    stack_depth: int,
-) -> tuple[StackNode, list[Interval]]:
+def rows_to_activities(rows, kind: str) -> list[tuple]:
+    """Turn a KERNEL/MEMCPY/MEMSET result set into flame-tree activity tuples.
+
+    Each tuple is (api_start, api_end, gpu_start, gpu_end, gpu_dur_ns, name, kind);
+    the `kind` becomes the leaf frame's kind ("gpu" / "memcpy" / "memset").
     """
-    Resolve each in-window kernel's enclosing NVTX stack and build the flame tree.
-    """
-    items = [
+    return [
         (
             r["api_start"],
             r["api_end"],
@@ -421,32 +492,97 @@ def build_flame_tree(
             r["gpu_end"],
             r["gpu_dur_ns"],
             r["kernel_name"],
+            kind,
         )
         for r in rows
     ]
-    items.sort(key=lambda t: t[0])
+
+
+def _stack_to_nvtx_frames(stack, stack_depth: int) -> FramePath:
+    """Enclosing NVTX stack -> flame-tree frames (outermost-first, depth-capped)."""
+    if not stack:
+        nvtx_frames: FramePath = [("<no nvtx>", "nvtx")]
+    else:
+        nvtx_frames = [(normalize(e.name), "nvtx") for e in stack]
+    if stack_depth > 0:
+        nvtx_frames = nvtx_frames[:stack_depth]
+    return nvtx_frames
+
+
+def build_flame_tree(
+    idx: NvtxIndex,
+    activities: list[tuple],
+    stack_depth: int,
+) -> tuple[StackNode, list[Interval]]:
+    """
+    Resolve each in-window GPU activity's enclosing NVTX stack and build the tree.
+
+    `activities` are (api_start, api_end, gpu_start, gpu_end, dur, name, kind)
+    tuples — kernels and, when included, memcpy/memset. Solo/idle accounting is
+    over the union of *all* activities, so memcpy-only spans no longer read as
+    idle.
+    """
+    items = sorted(activities, key=lambda t: t[0])
 
     # path, gpu_dur_ns
-    kernel_paths: list[tuple[FramePath, int]] = []
+    leaf_paths: list[tuple[FramePath, int]] = []
     gpu_intervals: list[Interval] = []
 
-    stack_iter = idx.iter_stacks((a, b) for a, b, _, _, _, _ in items)
-    for (_, _, g_s, g_e, k_dur, k_name), (_, _, stack) in zip(items, stack_iter):
-        if not stack:
-            nvtx_frames: FramePath = [("<no nvtx>", "nvtx")]
-        else:
-            nvtx_frames = [(normalize(e.name), "nvtx") for e in stack]
-
-        if stack_depth > 0:
-            nvtx_frames = nvtx_frames[:stack_depth]
-        kernel_paths.append((nvtx_frames + [(k_name, "gpu")], k_dur))
+    stack_iter = idx.iter_stacks((a, b) for a, b, _, _, _, _, _ in items)
+    for (_, _, g_s, g_e, dur, name, kind), (_, _, stack) in zip(items, stack_iter):
+        nvtx_frames = _stack_to_nvtx_frames(stack, stack_depth)
+        leaf_paths.append((nvtx_frames + [(name, kind)], dur))
         gpu_intervals.append((g_s, g_e))
 
     solos = compute_solo_times(gpu_intervals)
     tree = StackNode("<root>", "root")
-    for (path, k_dur), solo in zip(kernel_paths, solos):
-        tree.add_path(path, k_dur, solo)
+    for (path, dur), solo in zip(leaf_paths, solos):
+        tree.add_path(path, dur, solo)
     return tree, gpu_intervals
+
+
+def _idle_gaps(activity_intervals: list[Interval], ws: int, we: int) -> list[Interval]:
+    """Maximal [start, end) spans in [ws, we) covered by no GPU activity."""
+    gaps: list[Interval] = []
+    prev = ws
+    for s, e in _merge(activity_intervals):
+        if s > prev:
+            gaps.append((prev, s))
+        prev = max(prev, e)
+    if we > prev:
+        gaps.append((prev, we))
+    return gaps
+
+
+def add_attributed_idle(
+    idx: NvtxIndex,
+    tree: StackNode,
+    activity_intervals: list[Interval],
+    ws: int,
+    we: int,
+    stack_depth: int,
+) -> int:
+    """Distribute GPU-idle gaps under their enclosing NVTX scope as `<idle>` leaves.
+
+    Each gap is attributed to the innermost NVTX frame that fully encloses it
+    (resolved via the same sweep-line as kernels, keyed on GPU wall-time — idle
+    has no launch site, so attribution is approximate under heavy CPU-ahead
+    async). Gaps outside any NVTX frame land under `<no nvtx>`. Returns total
+    idle attributed (ns). Idle never overlaps GPU work, so solo == value.
+    """
+    gaps = _idle_gaps(activity_intervals, ws, we)
+    if not gaps:
+        return 0
+    total = 0
+    stack_iter = idx.iter_stacks(iter(gaps))
+    for (gs, ge), (_, _, stack) in zip(gaps, stack_iter):
+        dur = ge - gs
+        if dur <= 0:
+            continue
+        nvtx_frames = _stack_to_nvtx_frames(stack, stack_depth)
+        tree.add_path(nvtx_frames + [("<idle>", "idle")], dur, dur)
+        total += dur
+    return total
 
 
 def _resolve_html_path(flamegraph_out: str) -> Path:
@@ -459,6 +595,7 @@ def _resolve_html_path(flamegraph_out: str) -> Path:
 
 def write_report_flamegraph(
     tree: StackNode,
+    tree_idle: StackNode | None,
     flamegraph_out: str,
     db_path: str,
     rank: int | None,
@@ -474,7 +611,7 @@ def write_report_flamegraph(
         + (f" (rank {rank})" if rank is not None else "")
         + f" | post-warmup steps {skip_steps + 1}..{n_steps}"
     )
-    write_html(tree, html, title)
+    write_html(tree, tree_idle, html, title)
     print(
         f"Wrote flame graph: {html}   "
         "(open in browser — click-to-zoom, search, tooltip)"
@@ -489,12 +626,18 @@ def load_flame_tree(
     stack_depth: int,
     *,
     print_steps: bool,
-) -> tuple[StackNode | None, int, int | None]:
-    """Detect steps, build the post-warmup flame tree (with `<idle>` filled in).
+    include_memcpy: bool = True,
+    attribute_idle: bool = True,
+) -> tuple[StackNode | None, StackNode | None, int, int | None]:
+    """Detect steps and build the post-warmup flame tree(s).
 
-    Returns (tree, n_steps, rank). `tree` is None only when the post-warmup
-    window contains no kernels. When `print_steps` is set the per-step window
-    table is printed (the standalone gpu-flame behavior).
+    Returns (tree, tree_idle, n_steps, rank). `tree` is the pure GPU-activity
+    tree (kernels + optional memcpy/memset, NO idle) that drives the Sum/Solo
+    charts; `tree_idle` is a clone of it with GPU-idle added as `<idle>` leaves
+    (attributed under each gap's enclosing NVTX scope when `attribute_idle`, else
+    one root block) — it drives the third "Sum + idle" chart. `tree` is None only
+    when the window has no GPU activity; `tree_idle` is None when there is no
+    idle. When `print_steps` is set the per-step window table is printed.
     """
     conn = open_db(db_path)
     require_kernel_table(conn, db_path)
@@ -523,24 +666,51 @@ def load_flame_tree(
         )
 
     tree: StackNode | None = None
-    rows = conn.execute(KERNELS_IN_WINDOW_SQL, (window_start, window_end)).fetchall()
-    if rows:
-        tree, gpu_intervals = build_flame_tree(idx, rows, stack_depth)
+    tree_idle: StackNode | None = None
+    win = (window_start, window_end)
+    rows = conn.execute(KERNELS_IN_WINDOW_SQL, win).fetchall()
+    activities = rows_to_activities(rows, "gpu")
+    if include_memcpy:
+        if has_table(conn, "CUPTI_ACTIVITY_KIND_MEMCPY"):
+            activities += rows_to_activities(
+                conn.execute(MEMCPY_IN_WINDOW_SQL, win).fetchall(), "memcpy"
+            )
+        if has_table(conn, "CUPTI_ACTIVITY_KIND_MEMSET"):
+            activities += rows_to_activities(
+                conn.execute(MEMSET_IN_WINDOW_SQL, win).fetchall(), "memset"
+            )
+    if activities:
+        tree, gpu_intervals = build_flame_tree(idx, activities, stack_depth)
         idle = max(0, window_dur - union_len(gpu_intervals))
         if idle > 0:
-            tree.add_path([("<idle>", "idle")], idle, idle)
+            # idle lives ONLY in the third chart: clone the activity tree and add
+            # idle there, leaving the Sum/Solo tree pure GPU activity.
+            tree_idle = tree.clone()
+            if attribute_idle:
+                add_attributed_idle(
+                    idx,
+                    tree_idle,
+                    gpu_intervals,
+                    window_start,
+                    window_end,
+                    stack_depth,
+                )
+            else:
+                tree_idle.add_path([("<idle>", "idle")], idle, idle)
     conn.close()
-    return tree, len(steps), rank
+    return tree, tree_idle, len(steps), rank
 
 
 def run_single(args: argparse.Namespace) -> None:
     """Standard single-profile flow: step table + optional flame graph."""
-    tree, n_steps, rank = load_flame_tree(
+    tree, tree_idle, n_steps, rank = load_flame_tree(
         args.db,
         args.step_nvtx,
         args.skip_steps,
         args.stack_depth,
         print_steps=True,
+        include_memcpy=args.include_memcpy,
+        attribute_idle=args.attribute_idle,
     )
     if not args.flamegraph:
         return
@@ -548,7 +718,7 @@ def run_single(args: argparse.Namespace) -> None:
         print("No kernels in post-warmup window.")
         return
     write_report_flamegraph(
-        tree, args.flamegraph, args.db, rank, args.skip_steps, n_steps
+        tree, tree_idle, args.flamegraph, args.db, rank, args.skip_steps, n_steps
     )
 
 
@@ -568,13 +738,30 @@ def run_diff(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     print(f"=== current (after)  : {args.db} ===")
-    tree_b, n_steps_b, _ = load_flame_tree(
-        args.db, args.step_nvtx, args.skip_steps, args.stack_depth, print_steps=True
+    tree_b0, tree_b_idle, n_steps_b, _ = load_flame_tree(
+        args.db,
+        args.step_nvtx,
+        args.skip_steps,
+        args.stack_depth,
+        print_steps=True,
+        include_memcpy=args.include_memcpy,
+        attribute_idle=args.attribute_idle,
     )
     print(f"=== baseline (before): {args.diff} ===")
-    tree_a, n_steps_a, _ = load_flame_tree(
-        args.diff, args.step_nvtx, args.skip_steps, args.stack_depth, print_steps=True
+    tree_a0, tree_a_idle, n_steps_a, _ = load_flame_tree(
+        args.diff,
+        args.step_nvtx,
+        args.skip_steps,
+        args.stack_depth,
+        print_steps=True,
+        include_memcpy=args.include_memcpy,
+        attribute_idle=args.attribute_idle,
     )
+
+    # Diff includes idle (idle-attributed tree) when available, so idle deltas
+    # show; fall back to the pure-activity tree when a window had no idle.
+    tree_b = tree_b_idle if tree_b_idle is not None else tree_b0
+    tree_a = tree_a_idle if tree_a_idle is not None else tree_a0
 
     if tree_a is None or tree_b is None:
         print("No kernels in one of the post-warmup windows — nothing to diff.")
@@ -648,6 +835,24 @@ def parse_args() -> argparse.Namespace:
         "normalized per post-warmup step, and each frame is colored by the delta "
         "(red = more GPU time now, blue = less). Two views show 'before' and "
         "'after' widths so removed and added frames are both visible.",
+    )
+    p.add_argument(
+        "--include-memcpy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include GPU memcpy (H2D/D2H/D2D) and memset activities as flame-graph "
+        "leaves, not just compute kernels (default: on). These live in separate "
+        "CUPTI tables; with them off, memcpy-only spans count as <idle>. Use "
+        "--no-include-memcpy to restore compute-only behavior.",
+    )
+    p.add_argument(
+        "--attribute-idle",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Distribute GPU-idle gaps under the NVTX scope enclosing each gap "
+        "(so you can see which phase the GPU stalled in), rendered as <idle> "
+        "leaves throughout the tree (default: on). --no-attribute-idle instead "
+        "lumps all idle into one <idle> block at the root.",
     )
     args = p.parse_args()
     if args.skip_steps < 0:

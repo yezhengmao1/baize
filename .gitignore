@@ -24,3 +24,5 @@ dist/
 .scratch/
 *.folded
 *.html
+# ...but the packaged flame-graph templates are source, not generated output.
+!nsys_tools/templates/*.html

@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<!--
+  Template rendered by nsys_tools/tools/flamegraph.py :: write_html.
+  Substitutions performed by the renderer (plain string replace):
+    __TITLE__   page title (HTML-escaped)
+    __DATA__    JSON-encoded stack tree (one shared tree, two values per node:
+                sum / solo; the client materializes a `value` field per view by
+                recursive copy and derives overlap = sum - solo)
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>__TITLE__</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/d3-flame-graph@4.1.3/dist/d3-flamegraph.css">
+<style>
+  body { font-family: sans-serif; margin: 0; padding: 12px 18px; background: #fafafa; color: #222; }
+  h1 { margin: 2px 0 4px; font-size: 15px; }
+  h2 { margin: 14px 0 6px; font-size: 13px; border-bottom: 1px solid #ccc; padding-bottom: 2px; color: #333; }
+  .legend, .note { margin: 4px 0; font-size: 12px; color: #555; }
+  .legend .sw { display: inline-block; width: 12px; height: 12px; margin: 0 4px 0 10px; vertical-align: middle; border: 1px solid #aaa; }
+  #controls { margin: 8px 0; font-size: 13px; }
+  #controls input { padding: 4px 6px; font-size: 13px; width: 320px; font-family: monospace; }
+  #controls button { padding: 4px 10px; margin-right: 4px; font-size: 13px; }
+  .chart { margin-top: 4px; font-family: monospace; }
+  .d3-flame-graph rect { stroke: #fff; stroke-width: 0.4px; cursor: pointer; }
+  .d3-flame-graph-tip { font-family: monospace; font-size: 12px; background: #333; color: #fff; padding: 6px 8px; border-radius: 3px; max-width: 480px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>__TITLE__</h1>
+<div class="legend">__LEGEND__</div>
+<div class="note">__NOTE__</div>
+<div id="controls">
+  <input type="text" id="term" placeholder="Search frame name (case-insensitive regex)…"/>
+  <button id="btn-search">Search</button>
+  <button id="btn-clear">Clear</button>
+  <button id="btn-reset">Reset zoom</button>
+  <span id="search-stats" style="margin-left:12px;color:#555;font-size:12px;"></span>
+</div>
+<div class="note" style="color:#888;font-size:11px;margin-top:-4px;">
+  Tip: small frames (&lt;1% of total) are rendered as hairline strokes at root zoom — use the match count to confirm a hit and click a parent frame to zoom in.
+</div>
+<h2>__VIEW2_H2__</h2>
+<div id="chart_solo" class="chart"></div>
+<h2>__VIEW1_H2__</h2>
+<div id="chart_sum" class="chart"></div>
+<h2 id="h2_idle">Sum + idle attribution — same as Sum, plus GPU-idle gaps added as magenta <span style="color:#c0c">&lt;idle&gt;</span> leaves under the NVTX scope that enclosed each gap (which phase the GPU stalled in)</h2>
+<div id="chart_idle" class="chart"></div>
+<script src="https://d3js.org/d3.v7.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3-flame-graph@4.1.3/dist/d3-flamegraph.min.js"></script>
+<script>
+// Two trees. `treeData` = pure GPU activity (kernels + memcpy/memset, NO idle),
+// drives the Solo (non-overlap) and Sum (overlap) charts. `treeDataIdle` = the
+// same tree with GPU-idle added as <idle> leaves, drives the third chart; it is
+// null when there was no idle. Each node carries sum and solo; for a given view
+// we recursively copy the tree with `value` set to that field.
+var treeData = __DATA__;
+var treeDataIdle = __DATA_IDLE__;
+// Display labels for the two views and the diff term (parametrized so the same
+// renderer drives both the kernel sum/solo graph and the comm floor/wait graph).
+var VIEWLABEL = {sum: "__V1NAME__", solo: "__V2NAME__"};
+
+function fnv1a(s) {
+  var h = 2166136261;
+  for (var i = 0; i < s.length; i++) {
+    h = Math.imul(h ^ s.charCodeAt(i), 16777619) >>> 0;
+  }
+  return h;
+}
+function formatNs(ns) {
+  if (ns >= 1e9) return (ns / 1e9).toFixed(3) + " s";
+  if (ns >= 1e6) return (ns / 1e6).toFixed(3) + " ms";
+  if (ns >= 1e3) return (ns / 1e3).toFixed(3) + " us";
+  return Math.round(ns) + " ns";
+}
+function projectView(node, viewKey) {
+  // Copy the tree, picking `value` from the requested field.
+  var out = {
+    name:    node.name,
+    kind:    node.kind,
+    value:   node[viewKey] || 0,
+    sum:     node.sum,
+    solo:    node.solo
+  };
+  if (node.children) {
+    out.children = node.children.map(function(c) { return projectView(c, viewKey); });
+  }
+  return out;
+}
+// Pure color by kind + name — no overlap encoding.
+function baseColor(kind, name) {
+  var h = fnv1a(name || "");
+  if (kind === "gpu")  return { hue: 15 + (h % 35), sat: 82, lig: 58 };
+  // Memory movement (own hue bands, clear of GPU 15–49 / NVTX 180–254):
+  //   memcpy -> green, memset -> purple. They still get the Sum-view overlap
+  //   fade (memcpy on the copy engine often overlaps compute).
+  if (kind === "memcpy") return { hue: 140,          sat: 58, lig: 46 };
+  if (kind === "memset") return { hue: 275,          sat: 52, lig: 56 };
+  // Idle: bright magenta. Gray (any shade) is reserved for the overlap
+  // encoding in the Sum view, so idle uses a fully out-of-palette hue —
+  // no NVTX hue (180–254) or GPU hue (15–49) lands here, making idle
+  // bands instantly recognizable.
+  if (kind === "idle") return { hue: 320,           sat: 85, lig: 55 };
+  return                      { hue: 180 + (h % 75), sat: 50, lig: 62 };
+}
+function colorFor(d, mode) {
+  // d3-flame-graph marks search matches with d.highlight. A custom color
+  // mapper fully replaces the library default, so we must honor that flag
+  // ourselves — otherwise search runs but visual feedback is invisible.
+  if (d.highlight) return "#e600e6";
+  var bc = baseColor(d.data.kind || "nvtx", d.data.name || "");
+  // Idle has no overlap semantics (it's the absence of work) — keep it at
+  // its fixed dark-gray in every view so the color stays unambiguous.
+  if (d.data.kind === "idle") {
+    return "hsl(" + bc.hue + "," + bc.sat + "%," + bc.lig + "%)";
+  }
+  if (mode !== "sum") {
+    return "hsl(" + bc.hue + "," + bc.sat + "%," + bc.lig + "%)";
+  }
+  // Sum view: fade toward a pale neutral proportionally to the overlap ratio.
+  // Exposed  (overlap=0)  -> full saturation of base color  (this work is actually blocking the GPU).
+  // Hidden   (overlap=1)  -> desaturated + lightened       (this work piggy-backed on other GPU work).
+  var summ = d.data.sum || 0, solo = d.data.solo || 0;
+  var r = summ > 0 ? (summ - solo) / summ : 0;
+  var sat = bc.sat * (1 - r) + 12 * r;
+  var lig = bc.lig * (1 - r) + 86 * r;
+  return "hsl(" + bc.hue + "," + sat.toFixed(1) + "%," + lig.toFixed(1) + "%)";
+}
+
+// Case-insensitive search: default lib match is case-sensitive, which is
+// surprising when typing e.g. "muon" and not matching "TensorParallelMuon".
+function searchMatchCI(d, term) {
+  if (!term) return false;
+  var name = (d.data && (d.data.n || d.data.name)) || "";
+  try {
+    return new RegExp(term, "i").test(name);
+  } catch (_e) {
+    // Term isn't a valid regex — fall back to plain substring.
+    return name.toLowerCase().indexOf(term.toLowerCase()) >= 0;
+  }
+}
+
+// Search stats aggregated across both charts so the user sees one unified count.
+var searchStats = { n: 0, sum: 0, total: 0 };
+function renderSearchStats() {
+  var el = document.getElementById("search-stats");
+  if (!el) return;
+  if (!searchStats.n && !document.getElementById("term").value.trim()) {
+    el.textContent = "";
+    return;
+  }
+  if (searchStats.n === 0) {
+    el.textContent = "no matches";
+    el.style.color = "#b00";
+  } else {
+    el.textContent = searchStats.n + " matches  ·  " + formatNs(searchStats.sum) +
+      " (" + (100 * searchStats.sum / searchStats.total).toFixed(2) + "% of total)";
+    el.style.color = "#555";
+  }
+}
+
+function makeChart(containerSel, viewKey, srcTree, reportStats) {
+  var data = projectView(srcTree || treeData, viewKey);
+  var total = data.value || 1;
+  var c = flamegraph()
+    .width(Math.max(1200, window.innerWidth - 40))
+    .cellHeight(16)
+    .minFrameSize(0)  // render every frame (at least as a 1-px hairline) so search highlights are visible
+    .sort(true)
+    .selfValue(false)
+    .title("")
+    .setColorMapper(function(d) { return colorFor(d, viewKey); })
+    .setSearchMatch(searchMatchCI)
+    .setSearchHandler(function(results, searchSum, totalValue) {
+      // Only the pure Sum chart reports stats (Solo has the same shape; the
+      // idle chart has a different total). Ignore the others' callbacks.
+      if (reportStats) {
+        searchStats = { n: results.length, sum: searchSum, total: totalValue };
+        renderSearchStats();
+      }
+    })
+    .label(function(d) {
+      var summ = d.data.sum, solo = d.data.solo;
+      var pct  = (100 * d.value / total).toFixed(2);
+      var over = summ > 0 ? (100 * (summ - solo) / summ).toFixed(1) : "0.0";
+      return d.data.name +
+        "\n  " + (VIEWLABEL[viewKey] || viewKey) + ": " + formatNs(d.value) + " (" + pct + "% of total)" +
+        "\n  __V1NAME__:  " + formatNs(summ) +
+        "\n  __V2NAME__: " + formatNs(solo) +
+        "\n  __DIFFNAME__: " + over + "%  __DIFFFORMULA__";
+    })
+    .tooltip(true);
+  d3.select(containerSel).datum(data).call(c);
+  return c;
+}
+
+var chartSolo = makeChart("#chart_solo", "solo", null, false);
+var chartSum  = makeChart("#chart_sum",  "sum",  null, true);
+var charts = [chartSolo, chartSum];
+
+// Third chart: Sum view over the idle-attributed tree. Only when there is idle.
+if (treeDataIdle) {
+  charts.push(makeChart("#chart_idle", "sum", treeDataIdle, false));
+} else {
+  var h = document.getElementById("h2_idle"), d = document.getElementById("chart_idle");
+  if (h) h.style.display = "none";
+  if (d) d.style.display = "none";
+}
+
+function doSearch() {
+  var t = document.getElementById("term").value.trim();
+  if (!t) return;
+  charts.forEach(function(c) { c.search(t); });
+}
+function doClear() {
+  charts.forEach(function(c) { c.clear(); });
+  document.getElementById("term").value = "";
+  searchStats = { n: 0, sum: 0, total: 0 };
+  renderSearchStats();
+}
+function doReset() {
+  charts.forEach(function(c) { c.resetZoom(); });
+}
+document.getElementById("btn-search").onclick = doSearch;
+document.getElementById("btn-clear").onclick  = doClear;
+document.getElementById("btn-reset").onclick  = doReset;
+document.getElementById("term").addEventListener("keydown", function(e) {
+  if (e.key === "Enter") doSearch();
+});
+window.addEventListener("resize", function() {
+  var w = Math.max(1200, window.innerWidth - 40);
+  charts.forEach(function(c) { c.width(w); c.resetZoom(); });
+});
+</script>
+</body>
+</html>
