@@ -374,6 +374,90 @@ def write_csv(cfg: Config, maps, emb, path):
     print(f"\nWrote per-rank CSV -> {path}")
 
 
+# --- pipeline schedule (1F1B, vpp-interleaved) --------------------------------
+def _pp_program(p: int, v: int, m: int, d: int) -> list[tuple]:
+    """Megatron's fixed 1F1B op order for pipeline stage ``d`` — a list of
+    (kind, chunk, microbatch). Warmup forwards, then steady 1F/1B, then cooldown
+    backwards. Chunk selection follows get_model_chunk_id (group size p*v)."""
+    total = m * v
+    if v == 1:
+        num_warmup = min(p - 1 - d, total)
+    else:
+        num_warmup = min((p - 1 - d) * 2 + (v - 1) * p, total)
+    steady = total - num_warmup
+
+    def chunk_of(k: int, forward: bool) -> int:
+        c = (k % (p * v)) // p
+        return c if forward else (v - 1 - c)
+
+    fwd = [0] * v
+    bwd = [0] * v
+    prog: list[tuple] = []  # (kind, chunk, microbatch, phase)
+    for k in range(num_warmup):  # warmup: forwards only
+        c = chunk_of(k, True)
+        prog.append(("F", c, fwd[c], "warmup")); fwd[c] += 1
+    for k in range(steady):  # steady state: 1 forward, 1 backward
+        cf = chunk_of(num_warmup + k, True)
+        prog.append(("F", cf, fwd[cf], "steady")); fwd[cf] += 1
+        cb = chunk_of(k, False)
+        prog.append(("B", cb, bwd[cb], "steady")); bwd[cb] += 1
+    for k in range(steady, total):  # cooldown: backwards only
+        cb = chunk_of(k, False)
+        prog.append(("B", cb, bwd[cb], "cooldown")); bwd[cb] += 1
+    return prog
+
+
+def pp_schedule(p: int, v: int, m: int) -> tuple[list[dict], int]:
+    """1F1B schedule for ONE pipeline group (p stages, v vpp chunks, m microbatches).
+
+    Each device runs Megatron's fixed 1F1B op order (`_pp_program`) in program
+    order; op timings come from the data dependencies — a microbatch flows forward
+    through virtual stages vs = chunk*p + stage (0..p*v-1) and backward in reverse,
+    each op taking one unit. Returns (ops, makespan) with each op
+    {kind:'F'|'B', mb, chunk, stage, t} (t = integer start time)."""
+    V = p * v
+    programs = [_pp_program(p, v, m, d) for d in range(p)]
+    ptr = [0] * p
+    dev_t = [0] * p
+    end: dict = {}          # (kind, mb, vs) -> completion time
+    ops: list[dict] = []
+    total_ops = sum(len(pr) for pr in programs)
+    stalls = 0
+    while len(ops) < total_ops:
+        progressed = False
+        for d in range(p):
+            if ptr[d] >= len(programs[d]):
+                continue
+            kind, c, mb, phase = programs[d][ptr[d]]
+            vs = c * p + d
+            if kind == "F":  # needs the same microbatch out of the previous vs
+                if vs > 0 and ("F", mb, vs - 1) not in end:
+                    continue
+                dep = end.get(("F", mb, vs - 1), 0) if vs > 0 else 0
+            else:            # backward needs its own forward + the next vs's backward
+                if ("F", mb, vs) not in end:
+                    continue
+                if vs < V - 1 and ("B", mb, vs + 1) not in end:
+                    continue
+                dep = max(
+                    end.get(("B", mb, vs + 1), 0) if vs < V - 1 else 0,
+                    end[("F", mb, vs)],
+                )
+            t = max(dev_t[d], dep)
+            end[(kind, mb, vs)] = t + 1
+            dev_t[d] = t + 1
+            ops.append({"kind": kind, "mb": mb, "chunk": c, "stage": d,
+                        "t": t, "phase": phase})
+            ptr[d] += 1
+            progressed = True
+        if not progressed:  # safety: a correct 1F1B program never deadlocks
+            stalls += 1
+            if stalls > total_ops + 10:
+                break
+    makespan = max((o["t"] + 1 for o in ops), default=0)
+    return ops, makespan
+
+
 # --- SVG visualization: DP data-flow, organized by physical node --------------
 # The world is laid out as physical nodes (one row per node, GPUS_PER_NODE GPUs
 # each).  Each GPU is colored by its **data shard** — the data-parallel replica it
@@ -537,18 +621,106 @@ def _svg_content(cfg: Config, gpn: int) -> tuple[str, int, int]:
     return "".join(body), width, height
 
 
-def write_svg(cfg: Config, path: str, gpn: int = 8):
+_SCHED_CW, _SCHED_RH, _SCHED_CH = 16, 32, 20  # cell width / row pitch / box height
+
+# Per-phase background tint (behind the F/B cells) so warmup / steady / cooldown
+# are visually separable; the fill carries the phase, the cell carries F vs B.
+_PHASE_BAND = {
+    "warmup":   "hsl(45 90% 86%)",   # amber
+    "steady":   "hsl(145 42% 88%)",  # green
+    "cooldown": "hsl(280 48% 90%)",  # purple
+}
+_PHASE_LABEL = {"warmup": "warmup (fill)", "steady": "steady 1F1B",
+                "cooldown": "cooldown (drain)"}
+
+
+def _sched_color(kind: str, chunk: int) -> tuple[str, str]:
+    """Fill + stroke for a schedule cell: Forward = blue, Backward = orange; the
+    vpp chunk shifts lightness (chunk 0 lighter, chunk 1+ darker)."""
+    h, s = (212, 60) if kind == "F" else (28, 80)
+    lig = 68 - chunk * 15
+    return f"hsl({h} {s}% {lig}%)", f"hsl({h} {s}% {max(24, lig - 30)}%)"
+
+
+def _schedule_svg_content(cfg: Config, m: int, y0: float) -> tuple[str, int, float]:
+    """Gantt of the 1F1B pipeline schedule for one pp group, drawn from y0 down.
+    Returns (svg_body, width, bottom_y)."""
+    p = cfg.pp
+    v = cfg.layout.vpp if cfg.layout else 1
+    ops, mk = pp_schedule(p, v, m)
+    cw, rh, ch = _SCHED_CW, _SCHED_RH, _SCHED_CH  # cell width / row pitch / box height
+    x0 = _SVG_PAD + 96
+    top = y0 + 46
+    busy = 2 * p * v * m
+    bubble = (p * mk - busy) / (p * mk) if mk else 0
+
+    b: List[str] = []
+    b.append(f'<text class="title" x="{_SVG_PAD}" y="{y0 + 24:.0f}">'
+             f'PP 1F1B schedule — one pipeline group  (pp={p}, vpp={v}, {m} microbatches)</text>')
+    b.append(f'<text class="cfg" x="{_SVG_PAD}" y="{y0 + 40:.0f}">'
+             f'makespan {mk} slots · bubble {bubble * 100:.1f}% of the timeline · '
+             f'F=forward B=backward'
+             + (' · darker = later vpp chunk' if v > 1 else '')
+             + ' · dependency-scheduled 1F1B</text>')
+
+    # per-stage, per-phase background band (contiguous in time as ops run in order)
+    span: dict = {}
+    for o in ops:
+        k = (o["stage"], o["phase"])
+        lo, hi = span.get(k, (o["t"], o["t"] + 1))
+        span[k] = (min(lo, o["t"]), max(hi, o["t"] + 1))
+    for (s, ph), (lo, hi) in span.items():
+        ry = top + s * rh
+        b.append(f'<rect x="{x0 + lo * cw:.0f}" y="{ry:.0f}" '
+                 f'width="{(hi - lo) * cw:.0f}" height="{ch}" '
+                 f'fill="{_PHASE_BAND[ph]}"/>')
+    # each stage is its own boxed row (bold frame), with the label at the left
+    for s in range(p):
+        ry = top + s * rh
+        b.append(f'<rect x="{x0 - 4}" y="{ry:.0f}" width="{mk * cw + 8}" '
+                 f'height="{ch}" rx="4" fill="none" stroke="#5b6672" stroke-width="1.4"/>')
+        b.append(f'<text class="nodelbl" x="{_SVG_PAD}" y="{ry + ch / 2 + 4:.0f}">stage {s}</text>')
+    ph_h = ch - 5
+    for o in ops:
+        x = x0 + o["t"] * cw
+        yy = top + o["stage"] * rh + 2.5
+        fill, stroke = _sched_color(o["kind"], o["chunk"])
+        b.append(f'<rect x="{x:.1f}" y="{yy:.1f}" width="{cw - 1.5:.1f}" height="{ph_h}" '
+                 f'rx="2" fill="{fill}" stroke="{stroke}" stroke-width="0.8"/>')
+        b.append(f'<text class="rank" x="{x + (cw - 1.5) / 2:.1f}" y="{yy + ph_h - 4:.1f}" '
+                 f'font-size="8.5">{o["mb"]}</text>')
+
+    # phase legend, below the figure
+    ly = top + (p - 1) * rh + ch + 26
+    lx = x0
+    for ph in ("warmup", "steady", "cooldown"):
+        b.append(f'<rect x="{lx}" y="{ly - 11:.0f}" width="13" height="13" rx="2" '
+                 f'fill="{_PHASE_BAND[ph]}" stroke="#bbb"/>')
+        b.append(f'<text class="lg" x="{lx + 18}" y="{ly:.0f}">{_PHASE_LABEL[ph]}</text>')
+        lx += 18 + 8 * len(_PHASE_LABEL[ph]) + 24
+
+    bottom = ly + 12 + _SVG_PAD
+    width = x0 + mk * cw + _SVG_PAD
+    return "".join(b), width, bottom
+
+
+def write_svg(cfg: Config, path: str, gpn: int = 8, sched_m: int | None = None):
     content, width, height = _svg_content(cfg, gpn)
+    if sched_m is not None:
+        sc, w2, bottom = _schedule_svg_content(cfg, sched_m, height)
+        content += sc
+        width = max(width, w2)
+        height = bottom
     svg = (
         GROUPS_SVG_TEMPLATE
         .replace("__WIDTH__", str(width))
-        .replace("__HEIGHT__", str(height))
+        .replace("__HEIGHT__", str(round(height)))
         .replace("__CONTENT__", content)
     )
     out = path if path.endswith(".svg") else path + ".svg"
     with open(out, "w") as f:
         f.write(svg)
-    print(f"\nWrote DP data-flow SVG -> {out}")
+    print(f"\nWrote DP data-flow{' + PP schedule' if sched_m else ''} SVG -> {out}")
 
 
 def parse_args():
@@ -586,6 +758,11 @@ def parse_args():
                         "shard; links = DP gradient all-reduce)")
     p.add_argument("--gpus-per-node", type=int, default=8, metavar="N",
                    help="GPUs per physical node for the SVG layout (default 8)")
+    p.add_argument("--gbs", type=int, default=None, metavar="N",
+                   help="global batch size — append a 1F1B pipeline-schedule Gantt "
+                        "for one pp group to the --svg. #microbatches = gbs/(dp*mbs)")
+    p.add_argument("--mbs", type=int, default=1, metavar="N",
+                   help="micro-batch size for the schedule (default 1)")
     return p.parse_args()
 
 
@@ -608,5 +785,18 @@ if __name__ == "__main__":
     if args.csv:
         write_csv(cfg, maps, emb, args.csv)
 
+    sched_m = None
+    if args.gbs is not None:
+        denom = cfg.dp * args.mbs
+        if args.gbs % denom != 0:
+            print(f"\nWarning: gbs {args.gbs} not divisible by dp*mbs = "
+                  f"{cfg.dp}*{args.mbs} = {denom}; flooring.", file=sys.stderr)
+        sched_m = max(1, args.gbs // denom)
+        print(f"\nPP schedule: #microbatches = gbs/(dp*mbs) = {args.gbs}/"
+              f"({cfg.dp}*{args.mbs}) = {sched_m}  (pp={cfg.pp}, vpp="
+              f"{cfg.layout.vpp if cfg.layout else 1})")
+
     if args.svg:
-        write_svg(cfg, args.svg, args.gpus_per_node)
+        write_svg(cfg, args.svg, args.gpus_per_node, sched_m)
+    elif sched_m is not None:
+        print("  (pass --svg OUT to render the schedule Gantt)")
