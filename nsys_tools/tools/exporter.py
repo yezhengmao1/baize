@@ -27,7 +27,8 @@ Tracks:
   * GPU stream (--project)   -> NVTX scopes (projected) with kernel/memcpy/memset leaves
   * CPU thread (--cpu-nvtx)  -> add CPU-side NVTX on top of --project
   * CPU thread (--cuda-api)  -> CUDA runtime API calls
-  * launch flow (--flows)    -> CPU API call --> the GPU kernel it launched
+  * launch flow (default on) -> click a GPU kernel -> its CPU launch site
+                                (--no-flows to omit; --cuda-api for the exact API)
 
 Author: yezhengmaolove@gmail.com
 """
@@ -380,18 +381,19 @@ def emit_flows(con, w, win):
             continue
         gpid = GPU_PID_BASE + (r[1] or 0)
         for ph, pid, tid, ts in (("s", a[1], a[2], a[0]), ("f", gpid, r[2], r[0])):
-            e = {
+            # bp="e" binds each endpoint to its *enclosing* slice: the CPU launch
+            # site (cudaLaunchKernel with --cuda-api, else the enclosing NVTX op)
+            # and the GPU kernel — so clicking the kernel jumps to its launcher.
+            w.raw({
                 "ph": ph,
                 "pid": pid + w.pid_offset,
                 "tid": tid,
                 "name": "launch",
                 "cat": "launch",
                 "id": r[3],
+                "bp": "e",
                 "ts": (ts + w.time_offset - w.t0) / 1000.0,
-            }
-            if ph == "f":
-                e["bp"] = "e"
-            w.raw(e)
+            })
 
 
 def export_trace(con, idx, w, ws, we, args):
@@ -509,7 +511,13 @@ def parse_args() -> argparse.Namespace:
         help="Also emit CUDA runtime API calls on CPU threads (heavy)",
     )
     p.add_argument(
-        "--flows", action="store_true", help="Emit CPU-launch -> GPU-kernel flow arrows"
+        "--flows",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Emit CPU-launch -> GPU-kernel flow arrows (default on): click a GPU "
+        "kernel in Perfetto to jump to its launch site. Pair with --cuda-api to "
+        "land on the exact cudaLaunchKernel; otherwise it lands on the enclosing "
+        "NVTX op. Use --no-flows to omit.",
     )
     p.add_argument(
         "--no-align",
