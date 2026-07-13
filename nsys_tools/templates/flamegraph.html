@@ -44,6 +44,8 @@
 <div id="chart_solo" class="chart"></div>
 <h2>__VIEW1_H2__</h2>
 <div id="chart_sum" class="chart"></div>
+<h2>Count view — widths &prop; number of GPU activities (kernel launches + memcpy/memset); tooltip shows count and % of launches. Compare against Sum to spot many-tiny-kernel overhead (wide here, narrow in Sum)</h2>
+<div id="chart_count" class="chart"></div>
 <h2 id="h2_idle">Sum + idle attribution — same as Sum, plus GPU-idle gaps added as magenta <span style="color:#c0c">&lt;idle&gt;</span> leaves under the NVTX scope that enclosed each gap (which phase the GPU stalled in)</h2>
 <div id="chart_idle" class="chart"></div>
 <script src="https://d3js.org/d3.v7.js"></script>
@@ -58,7 +60,7 @@ var treeData = __DATA__;
 var treeDataIdle = __DATA_IDLE__;
 // Display labels for the two views and the diff term (parametrized so the same
 // renderer drives both the kernel sum/solo graph and the comm floor/wait graph).
-var VIEWLABEL = {sum: "__V1NAME__", solo: "__V2NAME__"};
+var VIEWLABEL = {sum: "__V1NAME__", solo: "__V2NAME__", count: "count"};
 
 function fnv1a(s) {
   var h = 2166136261;
@@ -73,6 +75,7 @@ function formatNs(ns) {
   if (ns >= 1e3) return (ns / 1e3).toFixed(3) + " us";
   return Math.round(ns) + " ns";
 }
+function fmtInt(n) { return Math.round(n).toLocaleString(); }
 function projectView(node, viewKey) {
   // Copy the tree, picking `value` from the requested field.
   var out = {
@@ -80,7 +83,8 @@ function projectView(node, viewKey) {
     kind:    node.kind,
     value:   node[viewKey] || 0,
     sum:     node.sum,
-    solo:    node.solo
+    solo:    node.solo,
+    count:   node.count || 0
   };
   if (node.children) {
     out.children = node.children.map(function(c) { return projectView(c, viewKey); });
@@ -162,6 +166,8 @@ function renderSearchStats() {
 function makeChart(containerSel, viewKey, srcTree, reportStats) {
   var data = projectView(srcTree || treeData, viewKey);
   var total = data.value || 1;
+  var isCount = viewKey === "count";
+  var countTotal = data.count || 1;
   var c = flamegraph()
     .width(Math.max(1200, window.innerWidth - 40))
     .cellHeight(16)
@@ -180,13 +186,17 @@ function makeChart(containerSel, viewKey, srcTree, reportStats) {
       }
     })
     .label(function(d) {
-      var summ = d.data.sum, solo = d.data.solo;
+      var summ = d.data.sum, solo = d.data.solo, cnt = d.data.count || 0;
       var pct  = (100 * d.value / total).toFixed(2);
       var over = summ > 0 ? (100 * (summ - solo) / summ).toFixed(1) : "0.0";
+      var primary = isCount
+        ? fmtInt(d.value) + " (" + pct + "% of launches)"
+        : formatNs(d.value) + " (" + pct + "% of total)";
       return d.data.name +
-        "\n  " + (VIEWLABEL[viewKey] || viewKey) + ": " + formatNs(d.value) + " (" + pct + "% of total)" +
+        "\n  " + (VIEWLABEL[viewKey] || viewKey) + ": " + primary +
         "\n  __V1NAME__:  " + formatNs(summ) +
         "\n  __V2NAME__: " + formatNs(solo) +
+        "\n  count: " + fmtInt(cnt) + " (" + (100 * cnt / countTotal).toFixed(2) + "% of launches)" +
         "\n  __DIFFNAME__: " + over + "%  __DIFFFORMULA__";
     })
     .tooltip(true);
@@ -194,11 +204,12 @@ function makeChart(containerSel, viewKey, srcTree, reportStats) {
   return c;
 }
 
-var chartSolo = makeChart("#chart_solo", "solo", null, false);
-var chartSum  = makeChart("#chart_sum",  "sum",  null, true);
-var charts = [chartSolo, chartSum];
+var chartSolo  = makeChart("#chart_solo",  "solo",  null, false);
+var chartSum   = makeChart("#chart_sum",   "sum",   null, true);
+var chartCount = makeChart("#chart_count", "count", null, false);
+var charts = [chartSolo, chartSum, chartCount];
 
-// Third chart: Sum view over the idle-attributed tree. Only when there is idle.
+// Sum + idle chart over the idle-attributed tree. Only when there is idle.
 if (treeDataIdle) {
   charts.push(makeChart("#chart_idle", "sum", treeDataIdle, false));
 } else {

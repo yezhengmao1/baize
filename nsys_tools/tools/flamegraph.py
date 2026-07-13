@@ -33,18 +33,20 @@ MARKER_W_MAX = 60  # max width of the 'marker' column in the step table
 
 
 class StackNode:
-    __slots__ = ("name", "kind", "value", "solo_value", "children")
+    __slots__ = ("name", "kind", "value", "solo_value", "count", "children")
 
     def __init__(self, name: str, kind: str):
         self.name = name
         self.kind = kind
         self.value = 0
         self.solo_value = 0
+        self.count = 0  # number of activities (kernel launches / gaps) through here
         self.children: dict[tuple[str, str], "StackNode"] = {}
 
     def add_path(self, frames: list[tuple[str, str]], value: int, solo: int) -> None:
         self.value += value
         self.solo_value += solo
+        self.count += 1
         cur = self
         for name, kind in frames:
             key = (name, kind)
@@ -54,6 +56,7 @@ class StackNode:
                 cur.children[key] = c
             c.value += value
             c.solo_value += solo
+            c.count += 1
             cur = c
 
     def clone(self) -> "StackNode":
@@ -62,6 +65,7 @@ class StackNode:
         n = StackNode(self.name, self.kind)
         n.value = self.value
         n.solo_value = self.solo_value
+        n.count = self.count
         n.children = {k: c.clone() for k, c in self.children.items()}
         return n
 
@@ -116,9 +120,9 @@ def _html_esc(s: str) -> str:
 def _tree_to_json(root: StackNode) -> dict:
     """Convert the stack tree into a view-agnostic d3-flame-graph JSON.
 
-    Each node carries the two additive quantities (sum / solo); the client-side
-    JS picks one as d.value per view, and derives overlap (= sum - solo) for
-    the Sum view's color saturation.
+    Each node carries the additive quantities (sum / solo GPU time, and count =
+    number of activities); the client-side JS picks one as d.value per view, and
+    derives overlap (= sum - solo) for the Sum view's color saturation.
     """
 
     def rec(node: StackNode) -> dict:
@@ -128,6 +132,7 @@ def _tree_to_json(root: StackNode) -> dict:
             "kind": node.kind,
             "sum": node.value,
             "solo": node.solo_value,
+            "count": node.count,
         }
         if node.children:
             out["children"] = [
@@ -162,7 +167,7 @@ LABELS = {
         "<i>overlap</i> encoding in the Sum view\n"
     ),
     "NOTE": (
-        "\n  Three charts below share the same hierarchy. Identity per node: "
+        "\n  Four charts below share the same hierarchy. Identity per node: "
         "<b>sum = solo + overlap</b>.<br>\n"
         "  <b>Solo</b> (non-overlap) — widths are per-activity solo time, the "
         "portion that actually blocks the GPU clock.<br>\n"
@@ -170,11 +175,15 @@ LABELS = {
         "saturation encodes overlap (vivid = exposed, pale = mostly hidden behind "
         "other GPU work). Wide + pale here but narrow in Solo → good concurrency; "
         "wide in both → fully exposed, optimization target.<br>\n"
+        "  <b>Count</b> — widths are the <i>number</i> of GPU activities (kernel "
+        "launches). Compare with Sum: wide in Count but narrow in Sum → lots of "
+        "tiny kernels (launch-bound), a fusion/CUDA-graph target.<br>\n"
         "  <b>Sum + idle</b> — the Sum chart plus GPU-idle gaps added as magenta "
         "&lt;idle&gt; leaves under the NVTX scope that enclosed each gap, so you "
         "see which phase the GPU stalled in. Idle appears in this chart only; the "
-        "first two are pure GPU activity.<br>\n"
-        "  Tooltip shows absolute sum / solo / overlap%.\n"
+        "others are pure GPU activity.<br>\n"
+        "  Tooltip shows absolute time (sum / solo / overlap%) and count / % of "
+        "launches for every node.\n"
     ),
     "VIEW1_H2": (
         "Sum view — widths ∝ Σ GPU kernel duration; "
