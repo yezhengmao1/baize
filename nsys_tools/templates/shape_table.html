@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<!--
+  Template rendered by nsys_tools/tools/kernel_shapes.py :: write_shape_html.
+  Plain string-replace placeholders:
+    __TITLE__     page title (HTML-escaped)
+    __SUBTITLE__  profile / rank / window line (HTML-escaped)
+    __ROWS__      JSON array of {op, shapes, calls, kernels, gpu, pct}  (compute op table)
+    __KERNELS__   JSON array of {op(name), shapes:null, calls, kernels, gpu, mn, mx, pct}  (all kernels)
+    __STATS__     JSON of the summary counters
+  Self-contained: no external scripts/fonts. Styled to match flamegraph.html.
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>__TITLE__</title>
+<style>
+  body { font-family: sans-serif; margin: 0; padding: 12px 18px; background: #fafafa; color: #222; }
+  h1 { margin: 2px 0 4px; font-size: 15px; }
+  h2 { margin: 16px 0 6px; font-size: 13px; border-bottom: 1px solid #ccc; padding-bottom: 2px; color: #333; }
+  .sub { color: #555; font-size: 12px; margin: 0 0 6px; }
+  .legend, .note { margin: 4px 0; font-size: 12px; color: #555; }
+  .legend .sw { display: inline-block; width: 12px; height: 12px; margin: 0 4px 0 10px; vertical-align: middle; border: 1px solid #aaa; border-radius: 2px; }
+  .legend .sw:first-child { margin-left: 0; }
+  .controls { margin: 8px 0; font-size: 13px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .controls input[type=search] { padding: 4px 6px; font-size: 13px; width: 300px; font-family: monospace; }
+  .controls input[type=number] { padding: 4px 6px; font-size: 13px; width: 60px; font-family: monospace; }
+  .seg button { padding: 4px 10px; font-size: 13px; border: 1px solid #bbb; background: #fff; color: #444; cursor: pointer; }
+  .seg button:first-child { border-radius: 3px 0 0 3px; }
+  .seg button:last-child { border-radius: 0 3px 3px 0; }
+  .seg button:not(:first-child) { border-left: none; }
+  .seg button.on { background: #4676b8; color: #fff; border-color: #4676b8; }
+
+  /* bars — monospace so shape/kernel digits align, like the flame chart */
+  .bars { font-family: monospace; }
+  .bar { display: grid; grid-template-columns: 340px 1fr 150px; align-items: center; gap: 10px; font-size: 12px; padding: 1px 0; }
+  .bar .lab { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .bar .lab b { font-weight: 600; }
+  .bar .lab .sh { color: #999; }
+  .track { background: #eaeaea; height: 15px; border-radius: 0 2px 2px 0; }
+  .fill { height: 100%; border-radius: 0 2px 2px 0; }
+  .bar .val { text-align: right; color: #555; white-space: nowrap; }
+  .bar:hover .track { outline: 1px solid #999; }
+
+  /* table */
+  .tablewrap { max-height: 560px; overflow: auto; border: 1px solid #ddd; border-radius: 3px; margin-top: 4px; }
+  table { border-collapse: collapse; width: 100%; font-family: monospace; font-size: 12px; }
+  th, td { text-align: right; padding: 3px 8px; border-bottom: 1px solid #eee; white-space: nowrap; }
+  th { color: #555; font-weight: 600; cursor: pointer; user-select: none; position: sticky; top: 0; background: #f2f2f2; }
+  th.up::after { content: " \25B2"; } th.down::after { content: " \25BC"; }
+  td.l, th.l { text-align: left; }
+  td.name { font-weight: 600; }
+  td.sh { color: #666; max-width: 560px; overflow: hidden; text-overflow: ellipsis; }
+  td .cellbar { display: inline-block; height: 9px; border-radius: 1px; vertical-align: middle; margin-right: 6px; }
+  .opdot { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-right: 6px; vertical-align: middle; border: 1px solid rgba(0,0,0,.15); }
+  tbody tr:hover td { background: #f3f6fb; }
+
+  /* tooltip — matches the flame-graph tip */
+  #tip { position: fixed; pointer-events: none; z-index: 9; font-family: monospace; font-size: 12px;
+         background: #333; color: #fff; padding: 6px 8px; border-radius: 3px; max-width: 480px;
+         display: none; white-space: pre-wrap; line-height: 1.5; }
+  #tip b { color: #ffd76a; }
+  #tip .m { color: #aaa; }
+</style>
+</head>
+<body>
+<h1>__TITLE__</h1>
+<div class="sub">__SUBTITLE__</div>
+<div class="note" id="note"></div>
+
+<h2>Top time sinks — widths &prop; &Sigma; GPU time</h2>
+<div class="controls">
+  <span class="seg" id="modeseg">
+    <button data-mode="row" class="on">by (operator, shapes)</button>
+    <button data-mode="op">by operator</button>
+    <button data-mode="kernel">by kernel</button>
+  </span>
+  <label>top <input type="number" id="topn" min="5" max="200" value="30" step="5"></label>
+  <span id="barnote" style="color:#888;font-size:11px;"></span>
+</div>
+<div class="bars" id="bars"></div>
+
+<h2>Table <span id="tblcount" style="font-weight:normal;color:#888;font-size:11px;"></span></h2>
+<div class="controls"><input type="search" id="q" placeholder="Filter by name or shape (substring)…"></div>
+<div class="tablewrap">
+  <table id="tbl"><thead><tr id="thead"></tr></thead><tbody></tbody></table>
+</div>
+
+<div id="tip"></div>
+<script>
+var ROWS = __ROWS__;
+var KERNELS = __KERNELS__;
+var STATS = __STATS__;
+ROWS.forEach(function(r){ r.avg = r.calls ? r.gpu / r.calls : 0; });
+KERNELS.forEach(function(r){ r.avg = r.calls ? r.gpu / r.calls : 0; });
+
+// Per-name color: same fnv1a-hash -> HSL scheme as the flame graph, over the
+// full hue wheel so distinct operators/kernels are distinguishable.
+function fnv1a(s){ var h=2166136261; for (var i=0;i<s.length;i++){ h=Math.imul(h^s.charCodeAt(i),16777619)>>>0; } return h; }
+var _col={};
+function opColor(op){ var c=_col[op]; if(!c){ c="hsl("+(fnv1a(op)%360)+",58%,56%)"; _col[op]=c; } return c; }
+function fmtNs(ns){
+  if (ns>=1e9) return (ns/1e9).toFixed(2)+" s";
+  if (ns>=1e6) return (ns/1e6).toFixed(2)+" ms";
+  if (ns>=1e3) return (ns/1e3).toFixed(1)+" us";
+  return Math.round(ns)+" ns";
+}
+function fmtInt(n){ return n.toLocaleString(); }
+function esc(s){ return String(s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
+
+// ---- note line (summary) ----
+document.getElementById("note").innerHTML =
+  "Op table (compute, shape-annotated): <b>&Sigma; "+fmtNs(STATS.op_gpu)+"</b> over "+fmtInt(STATS.n_ops)
+  + " (op, shapes), "+fmtInt(STATS.op_kernels)+" kernels. &nbsp;By-kernel (all compute kernels, "
+  + "communication — NCCL &amp; DeepEP — excluded): <b>&Sigma; "+fmtNs(STATS.kern_gpu)+"</b> over "
+  + fmtInt(STATS.kern_names)+" kernel names, "+fmtInt(STATS.kern_calls)+" launches.";
+
+// ---- data per mode ----
+var mode="row";
+function fullData(){
+  if (mode==="kernel") return KERNELS;
+  if (mode==="op"){
+    var m={};
+    ROWS.forEach(function(r){
+      var a=m[r.op]||(m[r.op]={op:r.op, shapes:null, calls:0, kernels:0, gpu:0, pct:0, nshapes:0});
+      a.calls+=r.calls; a.kernels+=r.kernels; a.gpu+=r.gpu; a.pct+=r.pct; a.nshapes++;
+    });
+    return Object.keys(m).map(function(k){var a=m[k]; a.avg=a.calls?a.gpu/a.calls:0; return a;});
+  }
+  return ROWS;
+}
+
+// ---- bars ----
+function renderBars(){
+  var data=fullData().slice().sort(function(a,b){return b.gpu-a.gpu;});
+  var total=data.length;
+  var n=Math.max(5, Math.min(200, parseInt(document.getElementById("topn").value)||30));
+  data=data.slice(0,n);
+  var max=data.length?data[0].gpu:1;
+  document.getElementById("barnote").textContent="showing top "+data.length+" of "+total;
+  document.getElementById("bars").innerHTML=data.map(function(r){
+    var w=(100*r.gpu/max).toFixed(2);
+    var lab;
+    if (mode==="op") lab='<b>'+esc(r.op)+'</b> <span class="sh">&middot; '+r.nshapes+' shape'+(r.nshapes>1?'s':'')+'</span>';
+    else if (mode==="kernel") lab='<b>'+esc(r.op)+'</b>';
+    else lab='<b>'+esc(r.op)+'</b> <span class="sh">'+esc(r.shapes)+'</span>';
+    return '<div class="bar" data-i="'+encodeURIComponent(JSON.stringify(r))+'">'
+      + '<div class="lab" title="'+esc(r.op)+'">'+lab+'</div>'
+      + '<div class="track"><div class="fill" style="width:'+w+'%;background:'+opColor(r.op)+'"></div></div>'
+      + '<div class="val">'+fmtNs(r.gpu)+' &middot; '+r.pct.toFixed(1)+'%</div></div>';
+  }).join("");
+}
+
+// ---- table (dynamic columns per mode) ----
+var COLS = {
+  row:    [{k:"op",t:"operator",l:1},{k:"shapes",t:"input_shapes",l:1},{k:"calls",t:"calls"},{k:"kernels",t:"kern"},{k:"gpu",t:"Σ gpu"},{k:"avg",t:"avg/call"},{k:"pct",t:"%"}],
+  op:     [{k:"op",t:"operator",l:1},{k:"nshapes",t:"#shapes"},{k:"calls",t:"calls"},{k:"kernels",t:"kern"},{k:"gpu",t:"Σ gpu"},{k:"avg",t:"avg/call"},{k:"pct",t:"%"}],
+  kernel: [{k:"op",t:"kernel",l:1},{k:"calls",t:"launches"},{k:"gpu",t:"Σ gpu"},{k:"avg",t:"avg"},{k:"mn",t:"min"},{k:"mx",t:"max"},{k:"pct",t:"%"}]
+};
+var NSKEYS={gpu:1,avg:1,mn:1,mx:1};
+var sortK="gpu", sortDir=-1, filt="";
+function cell(r,c,max){
+  var v=r[c.k];
+  if (c.k==="op") return '<td class="l name"><i class="opdot" style="background:'+opColor(r.op)+'"></i>'+esc(v)+'</td>';
+  if (c.k==="shapes") return '<td class="l sh" title="'+esc(v)+'">'+esc(v)+'</td>';
+  if (c.k==="pct") return '<td>'+v.toFixed(2)+'%</td>';
+  if (c.k==="gpu"){ var bw=(40*v/max).toFixed(1); return '<td><span class="cellbar" style="width:'+bw+'px;background:'+opColor(r.op)+'"></span>'+fmtNs(v)+'</td>'; }
+  if (NSKEYS[c.k]) return '<td>'+fmtNs(v)+'</td>';
+  return '<td>'+fmtInt(v)+'</td>';
+}
+function renderThead(){
+  document.getElementById("thead").innerHTML = COLS[mode].map(function(c){
+    var cls=(c.l?"l ":"")+(c.k===sortK?(sortDir>0?"up":"down"):"");
+    return '<th class="'+cls.trim()+'" data-k="'+c.k+'">'+c.t+'</th>';
+  }).join("");
+  document.querySelectorAll("#thead th").forEach(function(th){
+    th.addEventListener("click",function(){
+      var k=th.dataset.k;
+      if (k===sortK) sortDir*=-1; else { sortK=k; sortDir=(k==="op"||k==="shapes")?1:-1; }
+      renderThead(); renderTable();
+    });
+  });
+}
+function renderTable(){
+  var cols=COLS[mode];
+  if (!cols.some(function(c){return c.k===sortK;})) { sortK="gpu"; sortDir=-1; }
+  var rows=fullData();
+  if (filt){ var f=filt.toLowerCase(); rows=rows.filter(function(r){return r.op.toLowerCase().indexOf(f)>=0 || (r.shapes&&r.shapes.toLowerCase().indexOf(f)>=0);}); }
+  rows=rows.slice().sort(function(a,b){
+    var x=a[sortK], y=b[sortK];
+    if (typeof x==="string") return sortDir*(x<y?-1:x>y?1:0);
+    return sortDir*(x-y);
+  });
+  var max=rows.reduce(function(m,r){return Math.max(m,r.gpu);},1);
+  document.querySelector("#tbl tbody").innerHTML=rows.slice(0,2000).map(function(r){
+    return '<tr data-i="'+encodeURIComponent(JSON.stringify(r))+'">'+cols.map(function(c){return cell(r,c,max);}).join("")+'</tr>';
+  }).join("");
+  document.getElementById("tblcount").textContent =
+    "("+fmtInt(rows.length)+(rows.length>2000?" match, showing first 2000":"")+")";
+}
+
+// ---- tooltip (shared) ----
+var tip=document.getElementById("tip");
+function showTip(r,x,y){
+  var html='<b>'+esc(r.op)+'</b>';
+  if (r.shapes!=null) html+="\n"+esc(r.shapes);
+  else if (r.nshapes!=null) html+="\n"+'<span class="m">'+r.nshapes+' distinct shapes</span>';
+  html += "\n"+'<span class="m">Σ gpu </span>'+fmtNs(r.gpu)+'  ('+r.pct.toFixed(2)+'%)'
+       + "\n"+'<span class="m">'+(mode==="kernel"?"launches":"calls")+' </span>'+fmtInt(r.calls);
+  if (r.kernels!=null && mode!=="kernel") html+='   <span class="m">kernels </span>'+fmtInt(r.kernels);
+  html += "\n"+'<span class="m">avg   </span>'+fmtNs(r.avg);
+  if (r.mn!=null) html+="\n"+'<span class="m">min/max </span>'+fmtNs(r.mn)+' / '+fmtNs(r.mx);
+  tip.innerHTML=html; tip.style.display="block";
+  var w=tip.offsetWidth, h=tip.offsetHeight;
+  tip.style.left=Math.min(x+14, innerWidth-w-8)+"px";
+  tip.style.top=Math.max(8, y-h-10)+"px";
+}
+function hideTip(){ tip.style.display="none"; }
+function bindTip(el){
+  el.addEventListener("mousemove",function(e){
+    var t=e.target.closest("[data-i]"); if(!t){hideTip();return;}
+    showTip(JSON.parse(decodeURIComponent(t.dataset.i)), e.clientX, e.clientY);
+  });
+  el.addEventListener("mouseleave",hideTip);
+}
+bindTip(document.getElementById("bars"));
+bindTip(document.querySelector("#tbl tbody"));
+
+// ---- mode switch ----
+function renderAll(){ renderBars(); renderThead(); renderTable(); }
+document.getElementById("modeseg").addEventListener("click",function(e){
+  var b=e.target.closest("button"); if(!b) return;
+  mode=b.dataset.mode;
+  [].forEach.call(this.children,function(c){c.classList.toggle("on",c===b);});
+  renderAll();
+});
+document.getElementById("topn").addEventListener("input",renderBars);
+document.getElementById("q").addEventListener("input",function(){ filt=this.value.trim(); renderTable(); });
+
+renderAll();
+</script>
+</body>
+</html>

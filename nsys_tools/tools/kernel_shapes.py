@@ -17,9 +17,9 @@ Author: yezhengmaolove@gmail.com
 
 import argparse
 import csv as csvmod
+import json
 import re
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 from ..utils.common import (
@@ -88,6 +88,13 @@ def extract_sizes(name: str) -> str | None:
     return None
 
 
+def _stack_has_comm(stack) -> bool:
+    """True if any enclosing NVTX frame is communication plumbing (NCCL / c10d /
+    DeepEP FusedDispatch/Combine …) — used to tag comm kernels that aren't named
+    ncclDevKernel (e.g. DeepEP's `dispatch`/`combine`)."""
+    return any(normalize(e.name).startswith(_COMM_SCOPE_PREFIX) for e in stack)
+
+
 def op_frame(stack):
     """Innermost non-comm NVTX frame carrying a shape annotation.
 
@@ -125,8 +132,12 @@ def build_shape_table(idx: NvtxIndex, rows):
     """Attribute each in-window compute kernel to its innermost aten-op frame and
     aggregate by (operator, input-shapes).
 
-    Returns (table, stats) where table is a list of OpAgg and stats is a dict of
-    coverage counters (comm/no-shape kernels excluded, and their GPU time).
+    Returns (table, stats, kern_names):
+      - table: list of OpAgg per (operator, input-shapes).
+      - stats: coverage counters (comm / no-shape kernels excluded, and time).
+      - kern_names: {shortName: [calls, gpu, mn, mx]} over the **compute** kernels
+        only (all communication — NCCL and DeepEP — excluded), for the by-kernel
+        view; includes the compute kernels the op table drops as no-shape.
     """
     items = [
         (r["api_start"], r["api_end"], r["gpu_dur_ns"], r["kernel_name"]) for r in rows
@@ -137,6 +148,7 @@ def build_shape_table(idx: NvtxIndex, rows):
     # start, end). Accumulate kernel time per instance, then roll instances up
     # into per-(op, shapes) rows so `calls` counts invocations, not kernels.
     instances: dict[tuple, list] = {}  # key -> [op, shapes, gpu_sum, n_kernels]
+    kern_names: dict[str, list] = {}  # shortName -> [calls, gpu, mn, mx]
     stats = {
         "comm_kernels": 0,
         "comm_gpu": 0,
@@ -148,11 +160,27 @@ def build_shape_table(idx: NvtxIndex, rows):
 
     stacks = idx.iter_stacks((a, b) for a, b, _, _ in items)
     for (_, _, k_dur, k_name), (_, _, stack) in zip(items, stacks):
+        frame = op_frame(stack)
+        # A kernel is communication if it is an NCCL device kernel, or it carries
+        # no compute op frame yet sits under comm plumbing (DeepEP dispatch/combine
+        # etc.). Comm is excluded from both the op table and the by-kernel view.
+        is_comm = k_name.startswith(_COMM_KERNEL_PREFIX) or (
+            frame is None and _stack_has_comm(stack)
+        )
+        if not is_comm:
+            kn = kern_names.get(k_name)
+            if kn is None:
+                kern_names[k_name] = [1, k_dur, k_dur, k_dur]
+            else:
+                kn[0] += 1
+                kn[1] += k_dur
+                kn[2] = min(kn[2], k_dur)
+                kn[3] = max(kn[3], k_dur)
+
         if k_name.startswith(_COMM_KERNEL_PREFIX):
             stats["comm_kernels"] += 1
             stats["comm_gpu"] += k_dur
             continue
-        frame = op_frame(stack)
         if frame is None:
             stats["noshape_kernels"] += 1
             stats["noshape_gpu"] += k_dur
@@ -177,7 +205,7 @@ def build_shape_table(idx: NvtxIndex, rows):
         agg.kernels += n_kernels
         agg.gpu += gpu_sum
 
-    return list(table.values()), stats
+    return list(table.values()), stats, kern_names
 
 
 _SORT_KEYS = {
@@ -279,6 +307,108 @@ def write_csv(table: list[OpAgg], stats: dict, out: str) -> None:
     print(f"Wrote shape table CSV: {path} ({len(rows)} rows)")
 
 
+# =============================================================================
+# HTML visualization (ranked bars by operator + sortable table)
+# =============================================================================
+
+_SHAPE_TEMPLATE_PATH = (
+    Path(__file__).resolve().parent.parent / "templates" / "shape_table.html"
+)
+
+
+def _html_esc(s: str) -> str:
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def write_shape_html(
+    db_path: str,
+    rank: int | None,
+    table: list[OpAgg],
+    stats: dict,
+    kernels: dict,
+    n_steps: int,
+    skip_steps: int,
+    out: str,
+) -> None:
+    """Render the per-(operator, shapes) table as an interactive HTML page.
+
+    `kernels` is the per-kernel-name aggregation `{shortName: [calls, gpu, mn,
+    mx]}` from build_shape_table (compute only, all communication excluded) that
+    drives the page's "by kernel" view.
+    """
+    total_gpu = stats["op_gpu"] or 1
+    rows = sorted(table, key=_SORT_KEYS["time"])
+    rows_json = [
+        {
+            "op": a.op,
+            "shapes": a.shapes,
+            "calls": a.calls,
+            "kernels": a.kernels,
+            "gpu": a.gpu,
+            "pct": round(100.0 * a.gpu / total_gpu, 4),
+        }
+        for a in rows
+    ]
+
+    # kernels: {shortName: [calls, gpu, mn, mx]} (compute only, comm excluded)
+    total_kern_gpu = sum(v[1] for v in kernels.values()) or 1
+    total_kern_calls = sum(v[0] for v in kernels.values())
+    kernels_json = [
+        {
+            "op": name,
+            "shapes": None,
+            "calls": calls,
+            "kernels": calls,
+            "gpu": gpu,
+            "mn": mn,
+            "mx": mx,
+            "pct": round(100.0 * gpu / total_kern_gpu, 4),
+        }
+        for name, (calls, gpu, mn, mx) in sorted(
+            kernels.items(), key=lambda kv: -kv[1][1]
+        )
+    ]
+
+    stats_json = {
+        "op_gpu": stats["op_gpu"],
+        "op_kernels": stats["op_kernels"],
+        "n_ops": len(table),
+        "comm_gpu": stats["comm_gpu"],
+        "comm_kernels": stats["comm_kernels"],
+        "noshape_gpu": stats["noshape_gpu"],
+        "noshape_kernels": stats["noshape_kernels"],
+        "kern_gpu": total_kern_gpu,
+        "kern_names": len(kernels),
+        "kern_calls": total_kern_calls,
+    }
+    title = f"Per-operator input-shape breakdown — {Path(db_path).name}"
+    subtitle = (
+        (f"rank {rank} · " if rank is not None else "")
+        + f"post-warmup steps {skip_steps + 1}..{n_steps} · compute only "
+        "(communication excluded) in every view"
+    )
+
+    html = (
+        _SHAPE_TEMPLATE_PATH.read_text()
+        .replace("__TITLE__", _html_esc(title))
+        .replace("__SUBTITLE__", _html_esc(subtitle))
+        .replace("__STATS__", json.dumps(stats_json))
+        .replace("__KERNELS__", json.dumps(kernels_json, ensure_ascii=False))
+        .replace("__ROWS__", json.dumps(rows_json, ensure_ascii=False))
+    )
+    path = Path(out)
+    path = path.with_suffix(".html") if path.suffix.lower() == ".html" else Path(
+        str(path) + ".html"
+    )
+    path.write_text(html)
+    print(f"Wrote shape visualization: {path}   (open in browser)")
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Per-operator input-shape table over the post-warmup window "
@@ -318,6 +448,14 @@ def parse_args() -> argparse.Namespace:
         metavar="OUT",
         help="Write the full (untruncated) table to '<OUT>.csv'",
     )
+    p.add_argument(
+        "--html",
+        default=None,
+        metavar="OUT",
+        help="Write an interactive HTML visualization to '<OUT>.html' — ranked "
+        "bars (top time sinks, by (op,shapes) or aggregated by operator) plus a "
+        "sortable/filterable full table; self-contained, light+dark.",
+    )
     args = p.parse_args()
     if args.skip_steps < 0:
         p.error("--skip-steps must be >= 0")
@@ -349,7 +487,7 @@ if __name__ == "__main__":
     _, window_start, window_end = compute_step_windows(steps, t_min, args.skip_steps)
 
     rows = conn.execute(KERNELS_IN_WINDOW_SQL, (window_start, window_end)).fetchall()
-    table, stats = build_shape_table(idx, rows)
+    table, stats, kern_names = build_shape_table(idx, rows)
 
     print_table(
         args.db,
@@ -363,5 +501,10 @@ if __name__ == "__main__":
     )
     if args.csv:
         write_csv(table, stats, args.csv)
+    if args.html:
+        write_shape_html(
+            args.db, rank, table, stats, kern_names, len(steps), args.skip_steps,
+            args.html,
+        )
 
     conn.close()
