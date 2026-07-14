@@ -26,3 +26,7 @@ def gpu_exporter() -> None:
 
 def gpu_groups() -> None:
     runpy.run_module("nsys_tools.tools.parallel_groups", run_name="__main__")
+
+
+def gpu_sched() -> None:
+    runpy.run_module("nsys_tools.tools.pp_timeline", run_name="__main__")

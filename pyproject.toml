@@ -18,6 +18,7 @@ gpu-comm = "nsys_tools.cli:gpu_comm"
 gpu-shape = "nsys_tools.cli:gpu_shape"
 gpu-exporter = "nsys_tools.cli:gpu_exporter"
 gpu-groups = "nsys_tools.cli:gpu_groups"
+gpu-sched = "nsys_tools.cli:gpu_sched"
 
 [tool.setuptools]
 packages = ["nsys_tools", "nsys_tools.tools", "nsys_tools.utils"]
