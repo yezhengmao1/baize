@@ -55,6 +55,14 @@ MEM_TID_BASE = 1_000_000  # memcpy/memset sub-track offset in --flat mode
 PID_RANK_STRIDE = 100_000_000  # per-rank pid namespace when merging many ranks
 #   (> any real pid and > GPU_PID_BASE, so pid % stride recovers the GPU test)
 
+
+def _flow_id(pid_offset: int, corr: int) -> int:
+    """Per-rank-namespaced launch-flow id. correlationId is only unique within one
+    profile, so merging ranks needs a rank prefix — but Perfetto's legacy-JSON flow
+    binding wants a NUMERIC id (a string id silently fails to render), so encode it
+    as rank_index * 1e10 + correlationId (corr well under 1e10)."""
+    return (pid_offset // PID_RANK_STRIDE) * 10_000_000_000 + corr
+
 # --- SQL --------------------------------------------------------------------
 # GPU-op queries LEFT JOIN the launch-API interval so graph-launched ops (no
 # runtime row) are not dropped. Each ends in "WHERE "; the caller appends the
@@ -142,6 +150,12 @@ class TraceWriter:
         # is absolute wall time; t0 is the shared absolute origin. Integer math
         # (both are large ns ints) keeps full precision before the /1000 float.
         self.time_offset = 0
+        # per-rank-namespaced correlationId -> emitted (clamped) kernel start ns.
+        # Same-stream starts are clamped forward during emission to keep ops serial
+        # for strict Chrome nesting; launch flows must bind to that emitted start,
+        # not the raw kernel start, or the flow lands outside the slice and Perfetto
+        # can't connect it. Populated by x() as kernels are written, read by emit_flows.
+        self.kslice: dict[str, int] = {}
 
     def x(self, pid, tid, name, ts_ns, dur_ns, cat, args_obj=None):
         if dur_ns < self.min_dur_ns:
@@ -157,6 +171,10 @@ class TraceWriter:
         }
         if args_obj:
             e["args"] = args_obj
+        # Record this kernel's emitted (clamped) start so its launch flow binds to
+        # the slice's real position rather than the raw correlationId time.
+        if cat == "kernel" and args_obj and args_obj.get("correlationId") is not None:
+            self.kslice[_flow_id(self.pid_offset, args_obj["correlationId"])] = ts_ns
         self._write(e)
 
     def raw(self, e):
@@ -380,12 +398,17 @@ def emit_flows(con, w, win):
         if not a:
             continue
         gpid = GPU_PID_BASE + (r[1] or 0)
-        # Flow id MUST be namespaced per rank: correlationId is only unique within
-        # one profile, so when merging ranks the same value recurs and Perfetto
-        # would chain a CPU launch on one rank to a GPU kernel on another. Prefix
-        # with this rank's pid_offset so each rank's flows stay isolated.
-        flow_id = f"{w.pid_offset}:{r[3]}"
-        for ph, pid, tid, ts in (("s", a[1], a[2], a[0]), ("f", gpid, r[2], r[0])):
+        # Flow id MUST be namespaced per rank (correlationId only unique within one
+        # profile, else merged ranks cross-link) but stay NUMERIC (Perfetto's
+        # legacy-JSON flow binding drops string ids).
+        flow_id = _flow_id(w.pid_offset, r[3])
+        # GPU end must sit on the kernel's EMITTED (clamped) start, not the raw
+        # k.start — else for same-stream-overlapping kernels the flow lands just
+        # before the slice and won't bind. Skip if the kernel wasn't emitted.
+        f_ts = w.kslice.get(flow_id)
+        if f_ts is None:
+            continue
+        for ph, pid, tid, ts in (("s", a[1], a[2], a[0]), ("f", gpid, r[2], f_ts)):
             # bp="e" binds each endpoint to its *enclosing* slice: the CPU launch
             # site (cudaLaunchKernel with --cuda-api, else the enclosing NVTX op)
             # and the GPU kernel — so clicking the kernel jumps to its launcher.
@@ -418,6 +441,7 @@ def export_trace(con, idx, w, ws, we, args):
     # events that intersect [ws, we]; start>=0 drops nsys's stray pre-session range
     win = f"start < {we} AND end > {ws} AND start >= 0"
 
+    w.kslice.clear()  # emitted-kernel-start map is per rank
     ev0, trk0 = w.n, len(w.procs)
     if args.project:
         # Opt-in: nest each kernel under its NVTX stack on the GPU stream.
