@@ -26,7 +26,7 @@ Tracks:
   * CPU thread (default)     -> NVTX push/pop ranges as issued on the host
   * GPU stream (--project)   -> NVTX scopes (projected) with kernel/memcpy/memset leaves
   * CPU thread (--cpu-nvtx)  -> add CPU-side NVTX on top of --project
-  * CPU thread (--cuda-api)  -> CUDA runtime API calls
+  * CPU thread (default on)  -> CUDA runtime API calls (--no-cuda-api to drop)
   * launch flow (default on) -> click a GPU kernel -> its CPU launch site
                                 (--no-flows to omit; --cuda-api for the exact API)
 
@@ -380,6 +380,11 @@ def emit_flows(con, w, win):
         if not a:
             continue
         gpid = GPU_PID_BASE + (r[1] or 0)
+        # Flow id MUST be namespaced per rank: correlationId is only unique within
+        # one profile, so when merging ranks the same value recurs and Perfetto
+        # would chain a CPU launch on one rank to a GPU kernel on another. Prefix
+        # with this rank's pid_offset so each rank's flows stay isolated.
+        flow_id = f"{w.pid_offset}:{r[3]}"
         for ph, pid, tid, ts in (("s", a[1], a[2], a[0]), ("f", gpid, r[2], r[0])):
             # bp="e" binds each endpoint to its *enclosing* slice: the CPU launch
             # site (cudaLaunchKernel with --cuda-api, else the enclosing NVTX op)
@@ -390,7 +395,7 @@ def emit_flows(con, w, win):
                 "tid": tid,
                 "name": "launch",
                 "cat": "launch",
-                "id": r[3],
+                "id": flow_id,
                 "bp": "e",
                 "ts": (ts + w.time_offset - w.t0) / 1000.0,
             })
@@ -507,17 +512,20 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--cuda-api",
-        action="store_true",
-        help="Also emit CUDA runtime API calls on CPU threads (heavy)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Emit CUDA runtime API calls (cudaLaunchKernel, …) on CPU threads "
+        "(default on) so launch flows land on the exact launch slice. Adds a lot "
+        "of events; --no-cuda-api drops them (flows then land on the enclosing "
+        "NVTX op).",
     )
     p.add_argument(
         "--flows",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Emit CPU-launch -> GPU-kernel flow arrows (default on): click a GPU "
-        "kernel in Perfetto to jump to its launch site. Pair with --cuda-api to "
-        "land on the exact cudaLaunchKernel; otherwise it lands on the enclosing "
-        "NVTX op. Use --no-flows to omit.",
+        "kernel in Perfetto to jump to its launch site — the exact cudaLaunchKernel "
+        "(or the enclosing NVTX op under --no-cuda-api). Use --no-flows to omit.",
     )
     p.add_argument(
         "--no-align",
