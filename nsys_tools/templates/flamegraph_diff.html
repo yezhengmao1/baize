@@ -1,13 +1,15 @@
 <!DOCTYPE html>
 <!--
   Template rendered by nsys_tools/tools/flamegraph.py :: write_diff_html.
-  Substitutions performed by the renderer (plain string replace):
-    __TITLE__         page title (HTML-escaped)
-    __DATA__          JSON-encoded merged stack tree; each node carries two
-                      additive per-step values: a (baseline/before) and
-                      b (current/after). delta = b - a.
-    __BEFORE_LABEL__  baseline profile name
-    __AFTER_LABEL__   current profile name
+  The whole 4-view flame graph (Solo / Sum / Count / Sum+idle), TRIPLED top to
+  bottom: BEFORE (baseline) / AFTER (current) / DIFF (after - before).
+  Before & After are ordinary flame graphs (normal color-by-kind, Sum-view
+  overlap saturation); the Diff row uses After widths but colors each frame by
+  the per-metric delta. 12 charts share one hierarchy + one search/zoom.
+  Substitutions (plain string replace):
+    __TITLE__  __BEFORE_LABEL__  __AFTER_LABEL__
+    __DATA__       merged non-idle tree: node.a/.b = {sum,solo,count} per-step
+    __DATA_IDLE__  merged idle tree (node.a/.b = {sum,solo}) or null
 -->
 <html lang="en">
 <head>
@@ -17,13 +19,17 @@
 <style>
   body { font-family: sans-serif; margin: 0; padding: 12px 18px; background: #fafafa; color: #222; }
   h1 { margin: 2px 0 4px; font-size: 15px; }
-  h2 { margin: 14px 0 6px; font-size: 13px; border-bottom: 1px solid #ccc; padding-bottom: 2px; color: #333; }
+  h2.section { margin: 22px 0 2px; font-size: 15px; padding: 3px 8px; border-radius: 3px; color: #fff; }
+  h2.before { background: #4a72b0; }
+  h2.after  { background: #4a9b6e; }
+  h2.diff   { background: #a23b4d; }
+  h3 { margin: 12px 0 4px; font-size: 12.5px; color: #333; border-bottom: 1px solid #ddd; padding-bottom: 2px; }
   .legend, .note { margin: 4px 0; font-size: 12px; color: #555; }
   .legend .sw { display: inline-block; width: 12px; height: 12px; margin: 0 4px 0 10px; vertical-align: middle; border: 1px solid #aaa; }
-  #controls { margin: 8px 0; font-size: 13px; }
+  #controls { margin: 8px 0; font-size: 13px; position: sticky; top: 0; background: #fafafa; padding: 6px 0; z-index: 10; border-bottom: 1px solid #ddd; }
   #controls input { padding: 4px 6px; font-size: 13px; width: 320px; font-family: monospace; }
   #controls button { padding: 4px 10px; margin-right: 4px; font-size: 13px; }
-  .chart { margin-top: 4px; font-family: monospace; }
+  .chart { margin-top: 2px; font-family: monospace; }
   .d3-flame-graph rect { stroke: #fff; stroke-width: 0.4px; cursor: pointer; }
   .d3-flame-graph-tip { font-family: monospace; font-size: 12px; background: #333; color: #fff; padding: 6px 8px; border-radius: 3px; max-width: 520px; white-space: pre-wrap; }
 </style>
@@ -31,21 +37,26 @@
 <body>
 <h1>__TITLE__</h1>
 <div class="legend">
-  <span class="sw" style="background:hsl(0,75%,55%)"></span> more GPU time now (grew)
-  <span class="sw" style="background:hsl(0,0%,92%)"></span> ~unchanged
-  <span class="sw" style="background:hsl(210,75%,55%)"></span> less GPU time now (shrank)
+  <b>Before / After</b> (color by kind):
+  <span class="sw" style="background:hsl(210,45%,62%)"></span> NVTX
+  <span class="sw" style="background:hsl(25,80%,58%)"></span> GPU kernel
+  <span class="sw" style="background:hsl(140,58%,46%)"></span> memcpy
+  <span class="sw" style="background:hsl(275,52%,56%)"></span> memset
+  <span class="sw" style="background:hsl(320,85%,55%)"></span> idle
+  &nbsp; (Sum views fade pale ∝ overlap) &nbsp;|&nbsp;
+  <b>Diff</b>: <span class="sw" style="background:hsl(2,75%,55%)"></span> grew
+  <span class="sw" style="background:hsl(0,0%,92%)"></span> ~same
+  <span class="sw" style="background:hsl(212,75%,55%)"></span> shrank
   <br>
   before = <b>__BEFORE_LABEL__</b> &nbsp;·&nbsp; after = <b>__AFTER_LABEL__</b>
 </div>
 <div class="note">
-  Two charts share the merged hierarchy. Widths are Σ GPU kernel time per step;
-  color encodes the delta <b>after − before</b> (saturation ∝ |delta| / max |delta|).<br>
-  <b>Before</b> widths keep every baseline frame visible → blue frames that
-  shrank or were <i>removed</i> stand out.<br>
-  <b>After</b> widths keep every current frame visible → red frames that grew or
-  were <i>added</i> stand out.<br>
-  Tooltip shows before / after / delta / delta%. Values are per-step averages, so
-  profiles covering different step counts compare fairly.
+  The full 4-view flame graph (Solo / Sum / Count / Sum+idle) is shown three times:
+  <b>Before</b> (baseline) and <b>After</b> (current) are ordinary flame graphs;
+  the <b>Diff</b> row has the After widths but colors each frame by the delta
+  <b>after − before</b> of that view's metric (saturation ∝ |delta| / max|delta|
+  within the view). Widths are per-step averages, so different step counts compare
+  fairly. Search / zoom act on all charts at once.
 </div>
 <div id="controls">
   <input type="text" id="term" placeholder="Search frame name (case-insensitive regex)…"/>
@@ -54,164 +65,181 @@
   <button id="btn-reset">Reset zoom</button>
   <span id="search-stats" style="margin-left:12px;color:#555;font-size:12px;"></span>
 </div>
-<div class="note" style="color:#888;font-size:11px;margin-top:-4px;">
-  Tip: small frames (&lt;1% of total) are rendered as hairline strokes at root zoom — use the match count to confirm a hit and click a parent frame to zoom in.
-</div>
-<h2>Before view — widths ∝ Σ GPU time per step in <b>__BEFORE_LABEL__</b> (baseline); blue = shrank/removed</h2>
-<div id="chart_a" class="chart"></div>
-<h2>After view — widths ∝ Σ GPU time per step in <b>__AFTER_LABEL__</b> (current); red = grew/added</h2>
-<div id="chart_b" class="chart"></div>
+<div id="page"></div>
 <script src="https://d3js.org/d3.v7.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/d3-flame-graph@4.1.3/dist/d3-flamegraph.min.js"></script>
 <script>
-// One merged tree; each node carries per-step a (before) and b (after). For a
-// given view we recursively copy the tree with `value` set to that field.
-var treeData = __DATA__;
-var VIEWLABEL = {a: "before", b: "after"};
+var mainData = __DATA__;         // merged non-idle: node.a/.b = {sum,solo,count}
+var idleData = __DATA_IDLE__;    // merged idle: node.a/.b = {sum,solo}  (or null)
+var TREES = { main: mainData, idle: idleData };
 
 function fnv1a(s) {
   var h = 2166136261;
-  for (var i = 0; i < s.length; i++) {
-    h = Math.imul(h ^ s.charCodeAt(i), 16777619) >>> 0;
-  }
+  for (var i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619) >>> 0;
   return h;
 }
 function formatNs(ns) {
-  var sign = ns < 0 ? "-" : "";
-  ns = Math.abs(ns);
+  var sign = ns < 0 ? "-" : ""; ns = Math.abs(ns);
   if (ns >= 1e9) return sign + (ns / 1e9).toFixed(3) + " s";
   if (ns >= 1e6) return sign + (ns / 1e6).toFixed(3) + " ms";
   if (ns >= 1e3) return sign + (ns / 1e3).toFixed(3) + " us";
   return sign + Math.round(ns) + " ns";
 }
+function fmtInt(x) { return (x >= 0 ? "" : "-") + Math.abs(x).toFixed(Math.abs(x) < 100 ? 1 : 0); }
+function fmtVal(v, metric) { return metric === "count" ? fmtInt(v) : formatNs(v); }
 
-// Largest absolute delta across all non-root frames — the normalization scale
-// for color saturation. Excluding root keeps a small (or canceling) total delta
-// from washing out per-frame contrast.
-var maxDelta = 0;
-(function scan(node, isRoot) {
-  if (!isRoot) maxDelta = Math.max(maxDelta, Math.abs((node.b || 0) - (node.a || 0)));
-  if (node.children) node.children.forEach(function(c) { scan(c, false); });
-})(treeData, true);
-if (maxDelta <= 0) maxDelta = 1;
+function baseColor(kind, name) {
+  var h = fnv1a(name || "");
+  if (kind === "gpu")    return { hue: 15 + (h % 35), sat: 82, lig: 58 };
+  if (kind === "memcpy") return { hue: 140,           sat: 58, lig: 46 };
+  if (kind === "memset") return { hue: 275,           sat: 52, lig: 56 };
+  if (kind === "idle")   return { hue: 320,           sat: 85, lig: 55 };
+  return                        { hue: 180 + (h % 75), sat: 50, lig: 62 };
+}
 
-function projectView(node, viewKey) {
-  var out = {
-    name:  node.name,
-    kind:  node.kind,
-    value: node[viewKey] || 0,
-    a:     node.a || 0,
-    b:     node.b || 0
-  };
-  if (node.children) {
-    out.children = node.children.map(function(c) { return projectView(c, viewKey); });
-  }
+// project the merged tree onto one side + metric -> d3 value; carry a/b dicts
+function project(node, side, metric) {
+  var out = { name: node.name, kind: node.kind,
+              value: (node[side] && node[side][metric]) || 0, a: node.a, b: node.b };
+  if (node.children) out.children = node.children.map(function(c) { return project(c, side, metric); });
   return out;
 }
 
-// Diff color: red = grew (after > before), blue = shrank; saturation ∝
-// |delta| / maxDelta, so the biggest movers are the most vivid and unchanged
-// frames stay near-white.
-function diffColor(d) {
-  if (d.highlight) return "#e600e6";
-  var a = d.data.a || 0, b = d.data.b || 0, delta = b - a;
-  var frac = Math.min(1, Math.abs(delta) / maxDelta);
-  var lig = (96 - 46 * frac).toFixed(1);
-  var sat = (20 + 65 * frac).toFixed(1);
-  if (delta > 0) return "hsl(2,"   + sat + "%," + lig + "%)";  // red: more now
-  if (delta < 0) return "hsl(212," + sat + "%," + lig + "%)";  // blue: less now
-  return "hsl(0,0%,92%)";                                       // unchanged
+// biggest |delta| across non-root frames for a (tree, metric) — diff saturation scale
+function maxDeltaOf(root, metric) {
+  var mx = 0;
+  (function scan(n, isRoot) {
+    if (!isRoot) {
+      var a = (n.a && n.a[metric]) || 0, b = (n.b && n.b[metric]) || 0;
+      mx = Math.max(mx, Math.abs(b - a));
+    }
+    if (n.children) n.children.forEach(function(c) { scan(c, false); });
+  })(root, true);
+  return mx > 0 ? mx : 1;
 }
 
 function searchMatchCI(d, term) {
   if (!term) return false;
   var name = (d.data && (d.data.n || d.data.name)) || "";
-  try {
-    return new RegExp(term, "i").test(name);
-  } catch (_e) {
-    return name.toLowerCase().indexOf(term.toLowerCase()) >= 0;
-  }
+  try { return new RegExp(term, "i").test(name); }
+  catch (_e) { return name.toLowerCase().indexOf(term.toLowerCase()) >= 0; }
 }
-
 var searchStats = { n: 0, sum: 0, total: 0 };
 function renderSearchStats() {
-  var el = document.getElementById("search-stats");
-  if (!el) return;
-  if (!searchStats.n && !document.getElementById("term").value.trim()) {
-    el.textContent = "";
-    return;
-  }
-  if (searchStats.n === 0) {
-    el.textContent = "no matches";
-    el.style.color = "#b00";
-  } else {
+  var el = document.getElementById("search-stats"); if (!el) return;
+  if (!searchStats.n && !document.getElementById("term").value.trim()) { el.textContent = ""; return; }
+  if (searchStats.n === 0) { el.textContent = "no matches"; el.style.color = "#b00"; }
+  else {
     el.textContent = searchStats.n + " matches  ·  " + formatNs(searchStats.sum) +
       " (" + (100 * searchStats.sum / searchStats.total).toFixed(2) + "% of view)";
     el.style.color = "#555";
   }
 }
 
-function makeChart(containerSel, viewKey, reportStats) {
-  var data = projectView(treeData, viewKey);
+// color mappers -------------------------------------------------------------
+function colorPlain(d) {
+  if (d.highlight) return "#e600e6";
+  var bc = baseColor(d.data.kind || "nvtx", d.data.name || "");
+  return "hsl(" + bc.hue + "," + bc.sat + "%," + bc.lig + "%)";
+}
+function makeOverlapColor(side) {
+  return function (d) {
+    if (d.highlight) return "#e600e6";
+    var bc = baseColor(d.data.kind || "nvtx", d.data.name || "");
+    if (d.data.kind === "idle") return "hsl(" + bc.hue + "," + bc.sat + "%," + bc.lig + "%)";
+    var m = d.data[side] || {}, summ = m.sum || 0, solo = m.solo || 0;
+    var r = summ > 0 ? (summ - solo) / summ : 0;
+    var sat = bc.sat * (1 - r) + 12 * r, lig = bc.lig * (1 - r) + 86 * r;
+    return "hsl(" + bc.hue + "," + sat.toFixed(1) + "%," + lig.toFixed(1) + "%)";
+  };
+}
+function makeDiffColor(metric, maxD) {
+  return function (d) {
+    if (d.highlight) return "#e600e6";
+    var a = (d.data.a && d.data.a[metric]) || 0, b = (d.data.b && d.data.b[metric]) || 0;
+    var delta = b - a, frac = Math.min(1, Math.abs(delta) / maxD);
+    var lig = (96 - 46 * frac).toFixed(1), sat = (20 + 65 * frac).toFixed(1);
+    if (delta > 0) return "hsl(2,"   + sat + "%," + lig + "%)";
+    if (delta < 0) return "hsl(212," + sat + "%," + lig + "%)";
+    return "hsl(0,0%,92%)";
+  };
+}
+
+var charts = [];
+function makeChart(containerSel, treeData, side, metric, colorMapper, reportStats) {
+  var data = project(treeData, side, metric);
   var total = data.value || 1;
   var c = flamegraph()
     .width(Math.max(1200, window.innerWidth - 40))
-    .cellHeight(16)
-    .minFrameSize(0)
-    .sort(true)
-    .selfValue(false)
-    .title("")
-    .setColorMapper(diffColor)
+    .cellHeight(16).minFrameSize(0).sort(true).selfValue(false).title("")
+    .setColorMapper(colorMapper)
     .setSearchMatch(searchMatchCI)
     .setSearchHandler(function(results, searchSum, totalValue) {
-      if (reportStats) {
-        searchStats = { n: results.length, sum: searchSum, total: totalValue };
-        renderSearchStats();
-      }
+      if (reportStats) { searchStats = { n: results.length, sum: searchSum, total: totalValue }; renderSearchStats(); }
     })
     .label(function(d) {
-      var a = d.data.a || 0, b = d.data.b || 0, delta = b - a;
-      var pct  = (100 * d.value / total).toFixed(2);
-      var dpct = a > 0 ? ((100 * delta / a).toFixed(1) + "%")
-                       : (b > 0 ? "new" : "0%");
+      var a = (d.data.a && d.data.a[metric]) || 0, b = (d.data.b && d.data.b[metric]) || 0, delta = b - a;
+      var pct = (100 * d.value / total).toFixed(2);
+      var dpct = a > 0 ? ((100 * delta / a).toFixed(1) + "%") : (b > 0 ? "new" : "0%");
       return d.data.name +
-        "\n  " + VIEWLABEL[viewKey] + " width: " + formatNs(d.value) + " (" + pct + "% of view)" +
-        "\n  before: " + formatNs(a) +
-        "\n  after:  " + formatNs(b) +
-        "\n  delta:  " + (delta >= 0 ? "+" : "") + formatNs(delta) + "  (" + dpct + ")";
+        "\n  " + metric + " width: " + fmtVal(d.value, metric) + " (" + pct + "% of view)" +
+        "\n  before: " + fmtVal(a, metric) +
+        "\n  after:  " + fmtVal(b, metric) +
+        "\n  delta:  " + (delta >= 0 ? "+" : "") + fmtVal(delta, metric) + "  (" + dpct + ")";
     })
     .tooltip(true);
   d3.select(containerSel).datum(data).call(c);
+  charts.push(c);
   return c;
 }
 
-var chartA = makeChart("#chart_a", "a", true);
-var chartB = makeChart("#chart_b", "b", false);
-var charts = [chartA, chartB];
+// build the page: 3 sections x 4 views -------------------------------------
+var VIEWS = [
+  { key: "solo",  tree: "main", metric: "solo",  mode: "plain",   h3: "Solo — Σ per-activity solo time (the part that blocks the GPU clock)" },
+  { key: "sum",   tree: "main", metric: "sum",   mode: "overlap", h3: "Sum — Σ GPU-activity time (saturation = overlap; pale = hidden)" },
+  { key: "count", tree: "main", metric: "count", mode: "plain",   h3: "Count — number of GPU activities / kernel launches per step" },
+  { key: "idle",  tree: "idle", metric: "sum",   mode: "overlap", h3: "Sum + idle — Sum plus GPU-idle gaps (magenta), by enclosing scope" }
+];
+var SECTIONS = [
+  { key: "before", cls: "before", side: "a", diff: false, title: "BEFORE — baseline (__BEFORE_LABEL__)" },
+  { key: "after",  cls: "after",  side: "b", diff: false, title: "AFTER — current (__AFTER_LABEL__)" },
+  { key: "diff",   cls: "diff",   side: "b", diff: true,  title: "DIFF — after − before (red = grew, blue = shrank)" }
+];
 
-function doSearch() {
-  var t = document.getElementById("term").value.trim();
-  if (!t) return;
-  charts.forEach(function(c) { c.search(t); });
-}
-function doClear() {
-  charts.forEach(function(c) { c.clear(); });
-  document.getElementById("term").value = "";
-  searchStats = { n: 0, sum: 0, total: 0 };
-  renderSearchStats();
-}
-function doReset() {
-  charts.forEach(function(c) { c.resetZoom(); });
-}
+var page = document.getElementById("page");
+var maxDeltaCache = {};
+SECTIONS.forEach(function(sec) {
+  var h2 = document.createElement("h2"); h2.className = "section " + sec.cls; h2.textContent = sec.title; page.appendChild(h2);
+  VIEWS.forEach(function(v) {
+    if (v.tree === "idle" && !idleData) return;   // no idle window -> skip that view
+    var h3 = document.createElement("h3"); h3.innerHTML = v.h3; page.appendChild(h3);
+    var div = document.createElement("div"); div.className = "chart";
+    div.id = "chart_" + sec.key + "_" + v.key; page.appendChild(div);
+    var mapper;
+    if (sec.diff) {
+      var mk = v.tree + ":" + v.metric;
+      if (!(mk in maxDeltaCache)) maxDeltaCache[mk] = maxDeltaOf(TREES[v.tree], v.metric);
+      mapper = makeDiffColor(v.metric, maxDeltaCache[mk]);
+    } else if (v.mode === "overlap") {
+      mapper = makeOverlapColor(sec.side);
+    } else {
+      mapper = colorPlain;
+    }
+    var report = (sec.key === "after" && v.key === "sum");
+    makeChart("#" + div.id, TREES[v.tree], sec.side, v.metric, mapper, report);
+  });
+});
+
+function doSearch() { var t = document.getElementById("term").value.trim(); if (t) charts.forEach(function(c){ c.search(t); }); }
+function doClear() { charts.forEach(function(c){ c.clear(); }); document.getElementById("term").value = ""; searchStats = { n: 0, sum: 0, total: 0 }; renderSearchStats(); }
+function doReset() { charts.forEach(function(c){ c.resetZoom(); }); }
 document.getElementById("btn-search").onclick = doSearch;
 document.getElementById("btn-clear").onclick  = doClear;
 document.getElementById("btn-reset").onclick  = doReset;
-document.getElementById("term").addEventListener("keydown", function(e) {
-  if (e.key === "Enter") doSearch();
-});
+document.getElementById("term").addEventListener("keydown", function(e){ if (e.key === "Enter") doSearch(); });
 window.addEventListener("resize", function() {
   var w = Math.max(1200, window.innerWidth - 40);
-  charts.forEach(function(c) { c.width(w); c.resetZoom(); });
+  charts.forEach(function(c){ c.width(w); c.resetZoom(); });
 });
 </script>
 </body>

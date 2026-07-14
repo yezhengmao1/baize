@@ -231,7 +231,9 @@ def write_html(
 
 
 # =============================================================================
-# Differential flame graph (compare two stack trees: baseline vs current)
+# Differential flame graph (compare two stack trees: baseline vs current) —
+# the whole 4-view flame graph (Solo/Sum/Count/Sum+idle) tripled: Before / After
+# / Diff. See write_diff_html + templates/flamegraph_diff.html.
 # =============================================================================
 
 _DIFF_TEMPLATE_PATH = (
@@ -240,27 +242,31 @@ _DIFF_TEMPLATE_PATH = (
 FLAMEGRAPH_DIFF_HTML_TEMPLATE = _DIFF_TEMPLATE_PATH.read_text()
 
 
-def _diff_tree_to_json(
+def _merge_metrics_json(
     a: "StackNode | None",
     b: "StackNode | None",
     scale_a: float,
     scale_b: float,
 ) -> dict:
-    """Merge two aligned stack trees (baseline A, current B) into a diff node.
-
-    Every frame present in either tree appears once, carrying both its baseline
-    (`a`) and current (`b`) additive value (Σ GPU kernel time, scaled per-step so
-    windows covering different step counts stay comparable). The client picks one
-    as `value` per view and colors by the delta `b - a`.
+    """Merge aligned trees A (baseline) + B (current), carrying ALL metrics of
+    each side (sum / solo / count, per-step scaled) so the client can diff every
+    view (Solo / Sum / Count / Sum+idle). Every frame in either tree appears once.
     """
     ref = a if a is not None else b
     assert ref is not None
     label = frame_tag(ref.name, ref.kind) if ref.kind != "root" else "all"
-    va = a.value * scale_a if a is not None else 0.0
-    vb = b.value * scale_b if b is not None else 0.0
-    node = {"name": label, "kind": ref.kind, "a": va, "b": vb}
 
-    # Union of child keys, preserving first-seen order (A before B).
+    def side(node: "StackNode | None", s: float) -> dict:
+        if node is None:
+            return {"sum": 0.0, "solo": 0.0, "count": 0.0}
+        return {
+            "sum": node.value * s,
+            "solo": node.solo_value * s,
+            "count": node.count * s,
+        }
+
+    node = {"name": label, "kind": ref.kind, "a": side(a, scale_a), "b": side(b, scale_b)}
+
     keys: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for src in (a, b):
@@ -269,10 +275,9 @@ def _diff_tree_to_json(
                 if k not in seen:
                     seen.add(k)
                     keys.append(k)
-
     if keys:
         children = [
-            _diff_tree_to_json(
+            _merge_metrics_json(
                 a.children.get(k) if a is not None else None,
                 b.children.get(k) if b is not None else None,
                 scale_a,
@@ -280,9 +285,7 @@ def _diff_tree_to_json(
             )
             for k in keys
         ]
-        # Biggest frames (by the larger of the two sides) left-most as a stable
-        # fallback; d3-flame-graph re-sorts by the active view's value anyway.
-        children.sort(key=lambda n: -max(n["a"], n["b"]))
+        children.sort(key=lambda n: -max(n["a"]["sum"], n["b"]["sum"]))
         node["children"] = children
     return node
 
@@ -290,6 +293,8 @@ def _diff_tree_to_json(
 def write_diff_html(
     tree_a: StackNode,
     tree_b: StackNode,
+    tree_a_idle: StackNode | None,
+    tree_b_idle: StackNode | None,
     out_path: Path,
     title: str,
     label_a: str,
@@ -297,12 +302,25 @@ def write_diff_html(
     scale_a: float,
     scale_b: float,
 ) -> None:
-    """Write the interactive differential flame graph (baseline A vs current B)."""
+    """The whole 4-view flame graph (Solo/Sum/Count/Sum+idle) tripled: BEFORE
+    (baseline) / AFTER (current) / DIFF. Before/After are ordinary flame graphs;
+    the Diff row colors each frame by the per-metric delta (red = grew, blue =
+    shrank). `tree_a/b` (pure GPU activity) drive Solo/Sum/Count; the idle trees
+    drive Sum+idle (or that view is dropped when either window had no idle)."""
     data = json.dumps(
-        _diff_tree_to_json(tree_a, tree_b, scale_a, scale_b), ensure_ascii=False
+        _merge_metrics_json(tree_a, tree_b, scale_a, scale_b), ensure_ascii=False
+    )
+    data_idle = (
+        json.dumps(
+            _merge_metrics_json(tree_a_idle, tree_b_idle, scale_a, scale_b),
+            ensure_ascii=False,
+        )
+        if tree_a_idle is not None and tree_b_idle is not None
+        else "null"
     )
     html = (
         FLAMEGRAPH_DIFF_HTML_TEMPLATE.replace("__TITLE__", _html_esc(title))
+        .replace("__DATA_IDLE__", data_idle)
         .replace("__DATA__", data)
         .replace("__BEFORE_LABEL__", _html_esc(label_a))
         .replace("__AFTER_LABEL__", _html_esc(label_b))
@@ -767,12 +785,9 @@ def run_diff(args: argparse.Namespace) -> None:
         attribute_idle=args.attribute_idle,
     )
 
-    # Diff includes idle (idle-attributed tree) when available, so idle deltas
-    # show; fall back to the pure-activity tree when a window had no idle.
-    tree_b = tree_b_idle if tree_b_idle is not None else tree_b0
-    tree_a = tree_a_idle if tree_a_idle is not None else tree_a0
-
-    if tree_a is None or tree_b is None:
+    # Solo/Sum/Count come from the pure-activity trees; Sum+idle from the
+    # idle-attributed trees (present only when both windows had idle).
+    if tree_a0 is None or tree_b0 is None:
         print("No kernels in one of the post-warmup windows — nothing to diff.")
         return
 
@@ -784,15 +799,27 @@ def run_diff(args: argparse.Namespace) -> None:
     html = _resolve_html_path(args.flamegraph)
     label_a = Path(args.diff).name
     label_b = Path(args.db).name
-    title = f"Differential flame graph — {label_b} vs {label_a} (per-step Σ GPU time)"
-    write_diff_html(tree_a, tree_b, html, title, label_a, label_b, scale_a, scale_b)
+    title = f"Differential flame graph — {label_b} vs {label_a} (per-step, Solo/Sum/Count/Sum+idle)"
+    write_diff_html(
+        tree_a0,
+        tree_b0,
+        tree_a_idle,
+        tree_b_idle,
+        html,
+        title,
+        label_a,
+        label_b,
+        scale_a,
+        scale_b,
+    )
     print(
         f"Baseline steps/window: {steps_a}   Current steps/window: {steps_b}   "
         "(values normalized to per-step averages)"
     )
     print(
         f"Wrote diff flame graph: {html}   "
-        "(red = more time now, blue = less; two views = before / after widths)"
+        "(the 4-view flame graph ×3: Before / After [normal colors] / Diff "
+        "[red = grew, blue = shrank], each with Solo / Sum / Count / Sum+idle)"
     )
     print()
 
