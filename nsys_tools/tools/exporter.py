@@ -36,6 +36,7 @@ Author: yezhengmaolove@gmail.com
 import argparse
 import gzip
 import json
+import re
 import sqlite3
 import sys
 from collections import defaultdict
@@ -62,6 +63,7 @@ def _flow_id(pid_offset: int, corr: int) -> int:
     binding wants a NUMERIC id (a string id silently fails to render), so encode it
     as rank_index * 1e10 + correlationId (corr well under 1e10)."""
     return (pid_offset // PID_RANK_STRIDE) * 10_000_000_000 + corr
+
 
 # --- SQL --------------------------------------------------------------------
 # GPU-op queries LEFT JOIN the launch-API interval so graph-launched ops (no
@@ -99,6 +101,15 @@ FLOW_API_SQL = (
     "SELECT start,globalTid,correlationId FROM CUPTI_ACTIVITY_KIND_RUNTIME WHERE "
 )
 FLOW_KERNEL_SQL = "SELECT start,deviceId,streamId,correlationId FROM CUPTI_ACTIVITY_KIND_KERNEL WHERE "
+# Cross-rank comm-flow markers: NCCL P2P (P2p:commId=…:seq=…:func=Send/Recv) and
+# collectives (Op:comm=…:seq=…). commId/comm + seq is globally consistent across
+# the ranks that participate, so it links the SAME communication across ranks.
+COMM_FLOW_MARK_SQL = (
+    "SELECT n.start, n.globalTid, COALESCE(n.text, s.value) t "
+    "FROM NVTX_EVENTS n LEFT JOIN StringIds s ON s.id=n.textId "
+    "WHERE (COALESCE(n.text,s.value) LIKE 'P2p:commId=0x%' "
+    "OR COALESCE(n.text,s.value) LIKE '%:comm=0x%') AND n.start >= 0 AND "
+)
 # Metadata lookups (self-contained, no window).
 STRINGS_SQL = "SELECT id, value FROM StringIds"
 GPU_NAME_SQL = "SELECT id, name FROM TARGET_INFO_GPU"
@@ -156,6 +167,10 @@ class TraceWriter:
         # not the raw kernel start, or the flow lands outside the slice and Perfetto
         # can't connect it. Populated by x() as kernels are written, read by emit_flows.
         self.kslice: dict[str, int] = {}
+        # cross-rank comm-flow endpoints: key (comm handle + seq, globally consistent
+        # across the ranks in a collective/P2P) -> [(pid, tid, ts_us)]. Accumulated
+        # across ALL ranks (not cleared), emitted once at the end.
+        self.comm_pts: dict[tuple, list] = defaultdict(list)
 
     def x(self, pid, tid, name, ts_ns, dur_ns, cat, args_obj=None):
         if dur_ns < self.min_dur_ns:
@@ -388,6 +403,64 @@ def emit_cuda_api(con, w, win, strings, proc_name, thread_name):
         )
 
 
+_P2P_MARK_RE = re.compile(r"^P2p:commId=(0x[0-9a-f]+):rank=\d+:peer=\d+:seq=(\d+)")
+_COLL_MARK_RE = re.compile(r"^(\w+):comm=(0x[0-9a-f]+):seq=(\d+)")
+
+
+def collect_comm_flows(con, w, ws, we):
+    """Record this rank's comm markers' (pid, tid, ts) keyed by the globally
+    consistent (comm handle, seq) so emit_comm_flows can link them across ranks.
+    Uses the marker directly — no kernel association."""
+    seen: set = set()
+    for start, gtid, text in con.execute(
+        COMM_FLOW_MARK_SQL + f"n.start < {we} AND n.start >= {ws}"
+    ):
+        m = _P2P_MARK_RE.match(text)
+        if m:
+            key = ("p2p", m.group(1), int(m.group(2)))
+        else:
+            m = _COLL_MARK_RE.match(text)
+            if not m:
+                continue
+            key = ("coll", m.group(1), m.group(2), int(m.group(3)))
+        pid, tid = decode(gtid)
+        pid += w.pid_offset
+        if (key, pid) in seen:  # one endpoint per rank per key (drop push/pop dup)
+            continue
+        seen.add((key, pid))
+        ts = (start + w.time_offset - w.t0) / 1000.0
+        w.comm_pts[key].append((pid, tid, ts))
+
+
+def emit_comm_flows(w):
+    """Emit one cross-rank flow per comm key that has >= 2 endpoints in the trace
+    (a communication whose peers are all present); skip the rest. Distinct id
+    range and cat='comm' so it never collides with the launch flows."""
+    fid = 500_000_000_000_000  # above launch-flow ids, below 2^53
+    n = 0
+    for pts in w.comm_pts.values():
+        if len(pts) < 2:  # peer not in this trace -> nothing to connect
+            continue
+        pts.sort(key=lambda p: p[2])  # by time; s -> t… -> f draws the chain
+        last = len(pts) - 1
+        for i, (pid, tid, ts) in enumerate(pts):
+            w.raw(
+                {
+                    "ph": "s" if i == 0 else ("f" if i == last else "t"),
+                    "pid": pid,
+                    "tid": tid,
+                    "name": "comm",
+                    "cat": "comm",
+                    "id": fid,
+                    "bp": "e",
+                    "ts": ts,
+                }
+            )
+        fid += 1
+        n += 1
+    return n
+
+
 def emit_flows(con, w, win):
     api = {}
     for r in con.execute(FLOW_API_SQL + win):
@@ -412,16 +485,18 @@ def emit_flows(con, w, win):
             # bp="e" binds each endpoint to its *enclosing* slice: the CPU launch
             # site (cudaLaunchKernel with --cuda-api, else the enclosing NVTX op)
             # and the GPU kernel — so clicking the kernel jumps to its launcher.
-            w.raw({
-                "ph": ph,
-                "pid": pid + w.pid_offset,
-                "tid": tid,
-                "name": "launch",
-                "cat": "launch",
-                "id": flow_id,
-                "bp": "e",
-                "ts": (ts + w.time_offset - w.t0) / 1000.0,
-            })
+            w.raw(
+                {
+                    "ph": ph,
+                    "pid": pid + w.pid_offset,
+                    "tid": tid,
+                    "name": "launch",
+                    "cat": "launch",
+                    "id": flow_id,
+                    "bp": "e",
+                    "ts": (ts + w.time_offset - w.t0) / 1000.0,
+                }
+            )
 
 
 def export_trace(con, idx, w, ws, we, args):
@@ -460,6 +535,8 @@ def export_trace(con, idx, w, ws, we, args):
         emit_cuda_api(con, w, win, strings, proc_name, thread_name)
     if args.flows:
         emit_flows(con, w, win)
+    if args.comm_flows:
+        collect_comm_flows(con, w, ws, we)
     return w.n - ev0, len(w.procs) - trk0
 
 
@@ -550,6 +627,15 @@ def parse_args() -> argparse.Namespace:
         help="Emit CPU-launch -> GPU-kernel flow arrows (default on): click a GPU "
         "kernel in Perfetto to jump to its launch site — the exact cudaLaunchKernel "
         "(or the enclosing NVTX op under --no-cuda-api). Use --no-flows to omit.",
+    )
+    p.add_argument(
+        "--comm-flows",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Emit CROSS-RANK communication flows (default on): NCCL P2P and "
+        "collectives are linked across ranks by their (comm handle, seq) marker — "
+        "click a send to jump to the matching recv on the peer rank. Only drawn "
+        "when both endpoints are in the trace. --no-comm-flows to omit.",
     )
     p.add_argument(
         "--no-align",
@@ -664,8 +750,11 @@ if __name__ == "__main__":
     multi = len(ranks) > 1
     align = not args.no_align and all(c["epoch"] is not None for c in ranks)
     if not align and not args.no_align and multi:
-        print("Warning: session-start epoch missing on some file(s); overlaying at "
-              "t=0 without wall-clock alignment.", file=sys.stderr)
+        print(
+            "Warning: session-start epoch missing on some file(s); overlaying at "
+            "t=0 without wall-clock alignment.",
+            file=sys.stderr,
+        )
     for c in ranks:
         c["base"] = c["epoch"] if align else 0
     t0 = min(c["base"] + c["t_min"] for c in ranks)
@@ -675,11 +764,15 @@ if __name__ == "__main__":
     print(f"Exporting {len(ranks)} rank(s) ({mode}) -> {args.output}")
     if multi:
         if align:
-            print(f"  time: UTC-epoch aligned (capture-start stagger across ranks "
-                  f"= {stagger / 1e9:.3f} s)")
+            print(
+                f"  time: UTC-epoch aligned (capture-start stagger across ranks "
+                f"= {stagger / 1e9:.3f} s)"
+            )
         else:
-            print("  time: NOT aligned — overlaid at t=0"
-                  + (" (--no-align)" if args.no_align else ""))
+            print(
+                "  time: NOT aligned — overlaid at t=0"
+                + (" (--no-align)" if args.no_align else "")
+            )
 
     w = TraceWriter(args.output, t0, args.min_dur_ns)
     total_ev = 0
@@ -696,6 +789,10 @@ if __name__ == "__main__":
         total_ev += n_ev
         print(f"  {c['path']}: {c['sel']} -> {n_ev} events, {n_trk} tracks")
         c["conn"].close()
+    if args.comm_flows:
+        n_comm = emit_comm_flows(w)
+        total_ev += 2 * n_comm  # rough; s/f (+t) events
+        print(f"  comm flows (cross-rank NCCL P2P/collective): {n_comm}")
     n_trk_all = len(w.procs)
     w.close()
     print(f"Wrote {total_ev} events across {n_trk_all} tracks -> {args.output}")
