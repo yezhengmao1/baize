@@ -345,15 +345,17 @@ def build_durations(layout, dense_set, t, rc_map=None):
 
 
 # --- dependency-timed 1F1B schedule (real durations) --------------------------
-def schedule_timed(p, v, m, dur_f, dur_b):
+def schedule_timed(p, v, m, dur_f, dur_b, mb_group=None, overlap=False):
     """Interleaved 1F1B op timeline with wall-clock durations.
 
-    Same program order as parallel_groups._pp_program (Megatron interleaved 1F1B,
-    microbatch_group_size = pp); each op starts at max(device-free, data-dep-ready)
-    and lasts dur_f[vs]/dur_b[vs].  Returns (ops, makespan, busy_per_stage) with
-    each op {kind, mb, chunk, stage, vs, t, dur, phase}."""
+    Same program order as parallel_groups._pp_program (Megatron interleaved 1F1B);
+    ``mb_group`` = microbatch-group-size-per-virtual-pipeline-stage (default p),
+    ``overlap`` = combined-1F1B warmup (+1). Each op starts at max(device-free,
+    data-dep-ready) and lasts dur_f[vs]/dur_b[vs]. Returns
+    (ops, makespan, busy_per_stage) with each op
+    {kind, mb, chunk, stage, vs, t, dur, phase}."""
     V = p * v
-    programs = [_pp_program(p, v, m, d) for d in range(p)]
+    programs = [_pp_program(p, v, m, d, mb_group, overlap) for d in range(p)]
     ptr = [0] * p
     dev_t = [0.0] * p
     busy = [0.0] * p
@@ -655,12 +657,15 @@ def _issue_combined(comp, comm, F, B):
         comp.append(B["post"]["id"])  # embedding bwd
 
 
-def schedule_overlap(layout, dense_set, t, m, rc_map=None):
+def schedule_overlap(layout, dense_set, t, m, rc_map=None, mb_group=None, overlap=True):
     """Two-stream (comp/comm) combined-1F1B schedule with EP A2A overlap.
     Returns (nodes, makespan, comp_busy[d], comm_busy[d]); each node gets
     'start'/'end' (ms). Streams run in issue order; a node starts at
     max(stream-free, all data-preds done) — the exact per-stream list schedule.
-    ``rc_map`` (global-layer-id -> {parts}) inserts recompute nodes per layer."""
+    ``rc_map`` (global-layer-id -> {parts}) inserts recompute nodes per layer.
+    ``mb_group`` = microbatch-group-size-per-virtual-pipeline-stage (default p);
+    ``overlap`` (default True, the EP-A2A combined-1F1B) adds the +1 warmup so
+    steady steps pair independent F/B microbatches — required for mb_group < p."""
     p, v = layout.pp, layout.vpp
     V = p * v
     g = _NodeGen()
@@ -686,7 +691,7 @@ def schedule_overlap(layout, dense_set, t, m, rc_map=None):
     comp_q = {d: [] for d in range(p)}
     comm_q = {d: [] for d in range(p)}
     for d in range(p):
-        prog = _pp_program(p, v, m, d)
+        prog = _pp_program(p, v, m, d, mb_group, overlap)
         i = 0
         while i < len(prog):
             kind, c, mb, ph = prog[i]
@@ -703,9 +708,14 @@ def schedule_overlap(layout, dense_set, t, m, rc_map=None):
                 # B needs this F's output — so overlapping would deadlock. Issue
                 # such a pair sequentially instead.
                 bk, bc, bmb, bph = prog[i + 1]
-                _issue_combined(
-                    comp_q[d], comm_q[d], fwd[(mb, vs)], bwd[(bmb, bc * p + d)]
-                )
+                fop, bop = fwd[(mb, vs)], bwd[(bmb, bc * p + d)]
+                # keep the fused step coherent: mcore issues combined F+B as one
+                # unit, so its forward attn must not float ahead of when the paired
+                # backward can start (its grad-ready gate). Without this the
+                # attn_fwd greedily fills the pre-steady gap and detaches from its
+                # own dispatch (F far left of its D on the comp lane).
+                fop["first"]["preds"].extend(bop["first"]["preds"])
+                _issue_combined(comp_q[d], comm_q[d], fop, bop)
                 i += 2
             else:
                 if kind == "F":
@@ -1021,7 +1031,7 @@ def render_overlap_svg(
     p, v = layout.pp, layout.vpp
     ppu = px_per_unit / unit_ms
     PAD, LBL = 26, 112
-    LANE_H, LANE_GAP, ROW_GAP = 22, 3, 20
+    LANE_H, LANE_GAP, ROW_GAP = 26, 3, 20
     ROW_H = LANE_H * 2 + LANE_GAP
     row_pitch = ROW_H + ROW_GAP
     top = 104
@@ -1124,10 +1134,24 @@ def render_overlap_svg(
                 f'<rect x="{x:.2f}" y="{ly0 + 2:.1f}" width="{max(w, 0.4):.2f}" '
                 f'height="{LANE_H - 4}" fill="url(#rc)"/>'
             )
-        if w >= 8:
+        # box text: split top/bottom — top = op glyph, bottom = direction
+        # triangle (▲ forward / ▼ backward) + microbatch number
+        cx = x + w / 2
+        if w >= 13:
+            b.append(  # dominant: operation glyph (upper part, no divider)
+                f'<text x="{cx:.2f}" y="{ly0 + 13:.1f}" font-size="9.5" '
+                f'fill="#0f1b28" text-anchor="middle">'
+                f"{_esc(GLYPH.get(tok, tok))}</text>"
+            )
+            tri = "&#9650;" if n["kind"] == "F" else "&#9660;"  # ▲ fwd / ▼ bwd
+            b.append(  # small strip at the very bottom: direction + microbatch id
+                f'<text x="{cx:.2f}" y="{ly0 + 21:.1f}" font-size="6" '
+                f'fill="#5b6673" text-anchor="middle">{tri}{n["mb"]}</text>'
+            )
+        elif w >= 7:  # too narrow for two lines — op glyph only
             b.append(
-                f'<text x="{x + w / 2:.2f}" y="{ly0 + LANE_H / 2 + 3.2:.1f}" '
-                f'font-size="9" fill="#0f1b28" text-anchor="middle">'
+                f'<text x="{cx:.2f}" y="{ly0 + LANE_H / 2 + 3.2:.1f}" '
+                f'font-size="8.5" fill="#0f1b28" text-anchor="middle">'
                 f"{_esc(GLYPH.get(tok, tok))}</text>"
             )
 

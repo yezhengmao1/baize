@@ -375,35 +375,75 @@ def write_csv(cfg: Config, maps, emb, path):
 
 
 # --- pipeline schedule (1F1B, vpp-interleaved) --------------------------------
-def _pp_program(p: int, v: int, m: int, d: int) -> list[tuple]:
+def _schedule_table(m: int, v: int, g: int) -> list[tuple]:
+    """Megatron get_schedule_table: (microbatch_id, model_chunk_id) indexed by
+    virtual_microbatch_id. A group of ``g`` microbatches runs on chunk 0, then the
+    same g on chunk 1, ... (the last group grabs all remaining microbatches)."""
+    table: list[tuple] = []
+    for lo in range(0, m, g):
+        hi = m if lo + g >= m else lo + g
+        for c in range(v):
+            for mb in range(lo, hi):
+                table.append((mb, c))
+    return table
+
+
+def _pp_program(
+    p: int, v: int, m: int, d: int, g: int | None = None, overlap: bool = False
+) -> list[tuple]:
     """Megatron's fixed 1F1B op order for pipeline stage ``d`` — a list of
-    (kind, chunk, microbatch). Warmup forwards, then steady 1F/1B, then cooldown
-    backwards. Chunk selection follows get_model_chunk_id (group size p*v)."""
+    (kind, chunk, microbatch, phase). Faithful port of
+    forward_backward_pipelining_with_interleaving: warmup forwards, steady 1F1B
+    (forward vmb ``k+warmup`` paired with backward vmb ``k``), then cooldown
+    backwards. (mb, chunk) come from ``_schedule_table``; backward reverses the
+    chunk (``v-1-chunk``).
+
+    ``g`` = ``--microbatch-group-size-per-virtual-pipeline-stage`` (how many
+    microbatches run contiguously on one chunk before advancing). Default = ``p``.
+    ``overlap`` (EP-A2A combined-1F1B) adds one extra warmup forward so each steady
+    step pairs INDEPENDENT forward/backward microbatches.
+
+    mcore constraint (schedules.py:1006, only when interleaved v>1): the group must
+    satisfy ``p <= g <= m`` and ``m % g`` in ``{0} ∪ [p, ∞)``. ``g < p`` makes the
+    interleaved schedule INFEASIBLE — an early backward on a late stage depends on a
+    backward of an earlier stage whose own warmup forward depends back on that late
+    stage's not-yet-issued forward (a true dependency cycle, unbreakable by P2P
+    buffering), which is exactly why mcore rejects it."""
+    if g is None:
+        g = p
+    if v > 1:  # microbatch grouping only exists when interleaved
+        if not (p <= g <= m):
+            raise ValueError(
+                f"microbatch_group_size_per_vp_stage={g} must be in [pp={p}, m={m}] "
+                f"(mcore constraint; g<pp deadlocks the interleaved schedule)"
+            )
+        if 0 < (m % g) < p:
+            raise ValueError(
+                f"m % g = {m % g} must be 0 or >= pp={p} (else dependency bubbles)"
+            )
     total = m * v
+    table = _schedule_table(m, v, g)
+    mb_of = [e[0] for e in table]
+    chunk_of = [e[1] for e in table]
+
     if v == 1:
-        num_warmup = min(p - 1 - d, total)
+        num_warmup = p - 1 - d
     else:
-        num_warmup = min((p - 1 - d) * 2 + (v - 1) * p, total)
-    steady = total - num_warmup
+        num_warmup = (p - 1 - d) * 2 + (v - 1) * g
+        if overlap:
+            num_warmup += 1
+    num_warmup = min(num_warmup, total)
+    remaining = total - num_warmup
 
-    def chunk_of(k: int, forward: bool) -> int:
-        c = (k % (p * v)) // p
-        return c if forward else (v - 1 - c)
-
-    fwd = [0] * v
-    bwd = [0] * v
     prog: list[tuple] = []  # (kind, chunk, microbatch, phase)
     for k in range(num_warmup):  # warmup: forwards only
-        c = chunk_of(k, True)
-        prog.append(("F", c, fwd[c], "warmup")); fwd[c] += 1
-    for k in range(steady):  # steady state: 1 forward, 1 backward
-        cf = chunk_of(num_warmup + k, True)
-        prog.append(("F", cf, fwd[cf], "steady")); fwd[cf] += 1
-        cb = chunk_of(k, False)
-        prog.append(("B", cb, bwd[cb], "steady")); bwd[cb] += 1
-    for k in range(steady, total):  # cooldown: backwards only
-        cb = chunk_of(k, False)
-        prog.append(("B", cb, bwd[cb], "cooldown")); bwd[cb] += 1
+        prog.append(("F", chunk_of[k], mb_of[k], "warmup"))
+    for k in range(remaining):  # steady: forward(k+warmup) paired with backward(k)
+        fk = k + num_warmup
+        prog.append(("F", chunk_of[fk], mb_of[fk], "steady"))
+        prog.append(("B", v - 1 - chunk_of[k], mb_of[k], "steady"))
+    for k in range(remaining, total):  # cooldown: backwards only
+        prog.append(("B", v - 1 - chunk_of[k], mb_of[k], "cooldown"))
     return prog
 
 
