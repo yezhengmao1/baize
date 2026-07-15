@@ -132,6 +132,96 @@ GLYPH = {
     "L^": "Lʸ",
 }
 
+# --- recompute (activation checkpointing) -------------------------------------
+# A recompute token is a forward token + "~": the SAME forward op re-run at the
+# head of that layer's backward (so it reuses the forward's time t[base]). It is
+# drawn with a hatch overlay so a re-forward reads apart from the real forward.
+RECOMP_GLYPH = {"F~": "Fʳ", "D~": "Dʳ", "E~": "Eʳ", "C~": "Cʳ", "M~": "Mʳ"}
+RECOMP_LABEL = {
+    "F~": "Fʳ  attn recompute",
+    "D~": "Dʳ  dispatch recompute",
+    "E~": "Eʳ  moe-mlp recompute",
+    "C~": "Cʳ  combine recompute",
+    "M~": "Mʳ  dense-mlp recompute",
+}
+RECOMP_ORDER = ["F~", "D~", "E~", "C~", "M~"]
+GLYPH.update(RECOMP_GLYPH)
+LABEL.update(RECOMP_LABEL)
+
+
+def _rc_base(tok):
+    return tok[:-1] if tok.endswith("~") else tok
+
+
+def _is_rc(tok):
+    return tok.endswith("~")
+
+
+def _ttime(t, tok):
+    """Per-box time; recompute tokens reuse their base forward time."""
+    return t[_rc_base(tok)]
+
+
+def parse_recompute(spec, num_layers):
+    """Parse a fine-grained recompute selector into {global_layer_id: {parts}}.
+
+    parts are drawn from {"attn", "mlp"}. Grammar (case-insensitive):
+        SPEC   := TERM (';' TERM)*
+        TERM   := LAYERS ':' PARTS   |   LAYERS   (parts default to attn,mlp)
+        LAYERS := ('all' | id | a-b)(',' ...)*
+        PARTS  := ('all' | 'attn' | 'mlp')(',' ...)*
+    e.g. "all:attn,mlp"  "0-20:attn"  "all:mlp"  "3,5,7:attn;10-15:mlp".
+    Returns {} for "none"/empty (recompute off)."""
+    spec = (spec or "none").strip()
+    if spec.lower() in ("", "none"):
+        return {}
+    rc = {}
+    for term in spec.split(";"):
+        term = term.strip()
+        if not term:
+            continue
+        lsel, psel = (term.split(":", 1) + ["attn,mlp"])[:2] if ":" in term else (
+            term,
+            "attn,mlp",
+        )
+        gids = set()
+        for tok in lsel.split(","):
+            tok = tok.strip().lower()
+            if tok in ("all", "*"):
+                gids |= set(range(num_layers))
+            elif "-" in tok:
+                a, b = tok.split("-", 1)
+                gids |= set(range(int(a), int(b) + 1))
+            elif tok:
+                gids.add(int(tok))
+        parts = set()
+        for p in psel.split(","):
+            p = p.strip().lower()
+            if p in ("all", "*"):
+                parts |= {"attn", "mlp"}
+            elif p in ("attn", "mlp"):
+                parts.add(p)
+            elif p:
+                sys.exit(f"--recompute: unknown part {p!r} (use attn | mlp | all)")
+        for g in gids:
+            if 0 <= g < num_layers:
+                rc.setdefault(g, set()).update(parts)
+    return rc
+
+
+def recompute_tokens(parts, is_moe):
+    """Forward tokens re-run for a layer, in forward order, given its {parts}.
+
+    attn -> F ; mlp -> (dispatch,expert,combine) for MoE else dense-mlp M.
+    The MoE feed-forward recompute includes its dispatch/combine A2A (re-routing
+    tokens), so those land back on the comm stream (serial, i.e. exposed)."""
+    toks = []
+    if "attn" in parts:
+        toks.append("F")
+    if "mlp" in parts:
+        toks += ["D", "E", "C"] if is_moe else ["M"]
+    return toks
+
 
 def load_config(path):
     """Read a per-phase time config (JSON: {token: ms}); {} if no path.
@@ -186,12 +276,15 @@ def _flag(tok):
 
 
 # --- per-chunk sub-phase decomposition ---------------------------------------
-def chunk_segments(chunk, dense_set, t):
+def chunk_segments(chunk, dense_set, t, rc_map=None):
     """(fwd_segs, bwd_segs) for one layout chunk = lists of (token, ms).
 
     Forward walks the chunk's chars in order (E, layers, L); backward is the exact
     reverse computation (L^, layers reversed, V^), each layer emitting its grads.
+    ``rc_map`` (global-layer-id -> {parts}) prepends recompute (re-forward) tokens
+    to a layer's backward before its grads.
     """
+    rc_map = rc_map or {}
     fwd, layers_seq = [], []
     lids = list(chunk["layers"])
     li = 0
@@ -204,7 +297,7 @@ def chunk_segments(chunk, dense_set, t):
             gid = lids[li] if li < len(lids) else None
             li += 1
             dense = gid in dense_set
-            layers_seq.append(dense)
+            layers_seq.append((dense, gid))
             if dense:
                 fwd += [("F", t["F"]), ("M", t["M"])]
             else:
@@ -212,7 +305,10 @@ def chunk_segments(chunk, dense_set, t):
     bwd = []
     if any(c == "L" for c in chunk["chars"]):
         bwd.append(("L^", t["L^"]))
-    for dense in reversed(layers_seq):
+    for dense, gid in reversed(layers_seq):
+        if gid in rc_map:
+            for tok in recompute_tokens(rc_map[gid], not dense):
+                bwd.append((tok + "~", t[tok]))
         if dense:
             bwd += [
                 ("M^D", t["M^D"]),
@@ -234,7 +330,7 @@ def chunk_segments(chunk, dense_set, t):
     return fwd, bwd
 
 
-def build_durations(layout, dense_set, t):
+def build_durations(layout, dense_set, t, rc_map=None):
     """Per virtual-stage vs = chunk*pp + pp_rank: (fwd_segs, bwd_segs).
 
     layout.by_pp[d][c] is pp-rank d's vpp-chunk c (vpp-major id = c*pp + d)."""
@@ -242,7 +338,7 @@ def build_durations(layout, dense_set, t):
     seg_f, seg_b = {}, {}
     for c in range(v):
         for d in range(p):
-            fwd, bwd = chunk_segments(layout.by_pp[d][c], dense_set, t)
+            fwd, bwd = chunk_segments(layout.by_pp[d][c], dense_set, t, rc_map)
             seg_f[c * p + d] = fwd
             seg_b[c * p + d] = bwd
     return seg_f, seg_b
@@ -346,13 +442,13 @@ class _NodeGen:
 
 
 def _chunk_layer_dense(chunk, dense_set):
-    """List of per-'t'-layer dense flags, in written (forward) order."""
+    """List of per-'t'-layer (dense_flag, global_id), in written (forward) order."""
     out, lids, li = [], list(chunk["layers"]), 0
     for ch in chunk["chars"]:
         if ch in ("t", "m"):
             gid = lids[li] if li < len(lids) else None
             li += 1
-            out.append(gid in dense_set)
+            out.append((gid in dense_set, gid))
     return out
 
 
@@ -363,7 +459,7 @@ def _fwd_op(g, mb, vs, layout, dense_set, t):
     has_L = any(c == "L" for c in chunk["chars"])
     pre = g.mk("V", "comp", t["V"], mb, vs, "F", d) if has_E else None
     layers = []
-    for dense in _chunk_layer_dense(chunk, dense_set):
+    for dense, gid in _chunk_layer_dense(chunk, dense_set):
         if dense:
             layers.append(
                 {
@@ -405,18 +501,29 @@ def _fwd_op(g, mb, vs, layout, dense_set, t):
     return {"layers": layers, "pre": pre, "post": post, "first": first, "last": prev}
 
 
-def _bwd_op(g, mb, vs, layout, dense_set, t):
+def _bwd_op(g, mb, vs, layout, dense_set, t, rc_map=None):
+    rc_map = rc_map or {}
     d = vs % layout.pp
     chunk = layout.by_pp[d][vs // layout.pp]
     has_E = any(c == "E" for c in chunk["chars"])
     has_L = any(c == "L" for c in chunk["chars"])
     pre = g.mk("L^", "comp", t["L^"], mb, vs, "B", d) if has_L else None
     layers = []
-    for dense in reversed(_chunk_layer_dense(chunk, dense_set)):
+    for dense, gid in reversed(_chunk_layer_dense(chunk, dense_set)):
+        # recompute (re-forward) nodes for this layer, in forward order; the MoE
+        # feed-forward recompute rides the comm stream for its A2A but is chained
+        # (serial re-forward, so it stays exposed, not hidden under other compute)
+        recomp = []
+        for base in recompute_tokens(rc_map.get(gid, ()), not dense):
+            stream = "comm" if base in ("D", "C") else "comp"
+            recomp.append(g.mk(base + "~", stream, t[base], mb, vs, "B", d))
+        for a, bn in zip(recomp, recomp[1:]):
+            bn["preds"].append(a["id"])
         if dense:
             layers.append(
                 {
                     "moe": False,
+                    "recomp": recomp,
                     "combine_bwd": None,
                     "dispatch_bwd": None,
                     "mlp_dgrad": g.mk("M^D", "comp", t["M^D"], mb, vs, "B", d),
@@ -429,6 +536,7 @@ def _bwd_op(g, mb, vs, layout, dense_set, t):
             layers.append(
                 {
                     "moe": True,
+                    "recomp": recomp,
                     "combine_bwd": g.mk("C^", "comm", t["C^"], mb, vs, "B", d),
                     "mlp_dgrad": g.mk("E^D", "comp", t["E^D"], mb, vs, "B", d),
                     "mlp_wgrad": g.mk("E^W", "comp", t["E^W"], mb, vs, "B", d),
@@ -438,13 +546,22 @@ def _bwd_op(g, mb, vs, layout, dense_set, t):
                 }
             )
     post = g.mk("V^", "comp", t["V^"], mb, vs, "B", d) if has_E else None
-    # dgrad path: (L^) -> comb^->mlp_dgrad->disp^->attn_dgrad -> ... -> (V^);
-    # wgrads hang off their dgrad (delay_wgrad-style, off the critical path)
+    # dgrad path: (L^) -> [recompute] -> comb^->mlp_dgrad->disp^->attn_dgrad -> ...
+    # -> (V^); wgrads hang off their dgrad (delay_wgrad-style, off crit path).
+    # A layer's recompute waits its turn (gated on the incoming grad) and the
+    # layer's grads wait for the recompute to finish.
     prev = pre
     for L in layers:
-        if L["moe"]:
+        rc = L["recomp"]
+        if rc:
             if prev:
-                L["combine_bwd"]["preds"].append(prev["id"])
+                rc[0]["preds"].append(prev["id"])
+            gate = rc[-1]
+        else:
+            gate = prev
+        if L["moe"]:
+            if gate:
+                L["combine_bwd"]["preds"].append(gate["id"])
             L["mlp_dgrad"]["preds"].append(L["combine_bwd"]["id"])
             L["mlp_wgrad"]["preds"].append(L["mlp_dgrad"]["id"])
             L["dispatch_bwd"]["preds"].append(L["mlp_dgrad"]["id"])
@@ -452,8 +569,8 @@ def _bwd_op(g, mb, vs, layout, dense_set, t):
             L["attn_wgrad"]["preds"].append(L["attn_dgrad"]["id"])
             prev = L["attn_dgrad"]
         else:
-            if prev:
-                L["mlp_dgrad"]["preds"].append(prev["id"])
+            if gate:
+                L["mlp_dgrad"]["preds"].append(gate["id"])
             L["mlp_wgrad"]["preds"].append(L["mlp_dgrad"]["id"])
             L["attn_dgrad"]["preds"].append(L["mlp_dgrad"]["id"])
             L["attn_wgrad"]["preds"].append(L["attn_dgrad"]["id"])
@@ -461,7 +578,11 @@ def _bwd_op(g, mb, vs, layout, dense_set, t):
     if post:
         post["preds"].append(prev["id"])
         prev = post
-    first = pre or layers[0]["combine_bwd"] or layers[0]["mlp_dgrad"]
+    if pre:
+        first = pre
+    else:
+        L0 = layers[0]
+        first = (L0["recomp"] or [L0["combine_bwd"] or L0["mlp_dgrad"]])[0]
     return {"layers": layers, "pre": pre, "post": post, "first": first, "last": prev}
 
 
@@ -483,6 +604,8 @@ def _issue_bwd(comp, comm, op):
     if op["pre"]:
         comp.append(op["pre"]["id"])
     for L in op["layers"]:
+        for rn in L["recomp"]:
+            (comp if rn["stream"] == "comp" else comm).append(rn["id"])
         if L["combine_bwd"]:
             comm.append(L["combine_bwd"]["id"])
         comp.append(L["mlp_dgrad"]["id"])
@@ -509,6 +632,8 @@ def _issue_combined(comp, comm, F, B):
         if fl:
             comp.append(fl["attn"]["id"])  # attn_fwd
         if bl:
+            for rn in bl["recomp"]:  # this layer's re-forward, before its grads
+                (comp if rn["stream"] == "comp" else comm).append(rn["id"])
             comp.append(bl["mlp_dgrad"]["id"])  # mlp_bwd (dgrad)
             comp.append(bl["mlp_wgrad"]["id"])  # mlp_bwd (wgrad)
         if fl:
@@ -530,11 +655,12 @@ def _issue_combined(comp, comm, F, B):
         comp.append(B["post"]["id"])  # embedding bwd
 
 
-def schedule_overlap(layout, dense_set, t, m):
+def schedule_overlap(layout, dense_set, t, m, rc_map=None):
     """Two-stream (comp/comm) combined-1F1B schedule with EP A2A overlap.
     Returns (nodes, makespan, comp_busy[d], comm_busy[d]); each node gets
     'start'/'end' (ms). Streams run in issue order; a node starts at
-    max(stream-free, all data-preds done) — the exact per-stream list schedule."""
+    max(stream-free, all data-preds done) — the exact per-stream list schedule.
+    ``rc_map`` (global-layer-id -> {parts}) inserts recompute nodes per layer."""
     p, v = layout.pp, layout.vpp
     V = p * v
     g = _NodeGen()
@@ -544,7 +670,7 @@ def schedule_overlap(layout, dense_set, t, m):
         for mb in range(m)
     }
     bwd = {
-        (mb, vs): _bwd_op(g, mb, vs, layout, dense_set, t)
+        (mb, vs): _bwd_op(g, mb, vs, layout, dense_set, t, rc_map)
         for vs in range(V)
         for mb in range(m)
     }
@@ -626,10 +752,15 @@ def _esc(s):
 
 
 def _color(tok):
-    """(fill, stroke) for a phase token. Hue = family; lightness = fwd/dgrad/wgrad."""
-    fam, hue = FAMILY[tok]
+    """(fill, stroke) for a phase token. Hue = family; lightness = fwd/dgrad/wgrad.
+    Recompute tokens (base+"~") take the forward color; a hatch overlay drawn on
+    top (see _HATCH_DEFS) is what marks them as a re-forward."""
+    base = _rc_base(tok)
+    fam, hue = FAMILY[base]
     sat = 22 if fam == "embed" else 62
-    if tok in FWD_TOKENS:
+    if _is_rc(tok):
+        lig = 74  # re-forward: light, hatch overlay distinguishes it
+    elif tok in FWD_TOKENS:
         lig = 70
     elif tok.endswith("^W"):
         lig = 44
@@ -640,9 +771,22 @@ def _color(tok):
     return (f"hsl({hue},{sat}%,{lig}%)", f"hsl({hue},{sat}%,{max(22, lig - 30)}%)")
 
 
-def render_svg(ops, makespan, busy, layout, m, t, unit_ms, unit_name, px_per_unit, out):
+# hatch pattern painted over recompute boxes (one def, reused in both renderers)
+_HATCH_DEFS = (
+    '<defs><pattern id="rc" width="5" height="5" patternUnits="userSpaceOnUse" '
+    'patternTransform="rotate(45)">'
+    '<line x1="0" y1="0" x2="0" y2="5" stroke="#12202e" stroke-width="1.2" '
+    'stroke-opacity="0.32"/></pattern></defs>'
+)
+
+
+def render_svg(
+    ops, makespan, busy, layout, m, t, unit_ms, unit_name, px_per_unit, out,
+    extra_toks=(),
+):
     """All widths/labels are in UNITS (1 unit = unit_ms ms, the --unit phase).
-    Every sub-phase box carries its value in units; each pp row shows its bubble%."""
+    Every sub-phase box carries its value in units; each pp row shows its bubble%.
+    ``extra_toks`` = recompute tokens to add to the legend."""
     p, v = layout.pp, layout.vpp
     ppu = px_per_unit / unit_ms  # px per ms (derived)
     PAD, LBL = 26, 96
@@ -663,10 +807,10 @@ def render_svg(ops, makespan, busy, layout, m, t, unit_ms, unit_name, px_per_uni
 
     # legend = a single horizontal flow (left->right), packed by label width and
     # wrapping only if the row would overrun the plot width
-    toks = FWD_TOKENS + BWD_TOKENS
+    toks = FWD_TOKENS + BWD_TOKENS + list(extra_toks)
 
     def _leg_item_w(tok):
-        txt = f"{LABEL[tok]} ({u(t[tok]):.2f}u)"
+        txt = f"{LABEL[tok]} ({u(_ttime(t, tok)):.2f}u)"
         return 13 + 6 + len(txt) * 6.0 + 22  # swatch + gap + text + trailing
 
     leg_wrap = max(plot_w + 6, 600.0)
@@ -693,6 +837,7 @@ def render_svg(ops, makespan, busy, layout, m, t, unit_ms, unit_name, px_per_uni
         f"({makespan:.0f} ms) &#183; busiest {u(ideal):.1f} u &#183; "
         f"overall bubble {bubble * 100:.1f}%</text>",
     ]
+    b.append(_HATCH_DEFS)
 
     # time grid + axis ticks, in UNITS (~12 ticks)
     raw = mk_u / 12 if mk_u else 1
@@ -757,6 +902,11 @@ def render_svg(ops, makespan, busy, layout, m, t, unit_ms, unit_name, px_per_uni
                 f"{'F' if o['kind'] == 'F' else 'B'} vpp{o['chunk']} pp{o['stage']} "
                 f"&#183; {_esc(tok)} = {val:.2f} u ({ms:.3f} ms)</title></rect>"
             )
+            if _is_rc(tok):  # hatch overlay marks a re-forward (recompute)
+                b.append(
+                    f'<rect x="{cx:.2f}" y="{ry + 7:.1f}" '
+                    f'width="{max(w, 0.4):.2f}" height="{seg_h}" fill="url(#rc)"/>'
+                )
             # phase glyph only (NO time in the box); value lives in the tooltip
             # + the bottom legend
             if w >= 8:
@@ -790,9 +940,14 @@ def render_svg(ops, makespan, busy, layout, m, t, unit_ms, unit_name, px_per_uni
             f'<rect x="{x:.1f}" y="{yy - 10}" width="13" height="13" rx="2" '
             f'fill="{fill}" stroke="{stroke}"/>'
         )
+        if _is_rc(tok):
+            b.append(
+                f'<rect x="{x:.1f}" y="{yy - 10}" width="13" height="13" rx="2" '
+                f'fill="url(#rc)"/>'
+            )
         b.append(
             f'<text x="{x + 18:.1f}" y="{yy}" font-size="10.5" fill="#374151">'
-            f"{_esc(LABEL[tok])} ({u(t[tok]):.2f}u)</text>"
+            f"{_esc(LABEL[tok])} ({u(_ttime(t, tok)):.2f}u)</text>"
         )
 
     b.append("</svg>")
@@ -801,12 +956,12 @@ def render_svg(ops, makespan, busy, layout, m, t, unit_ms, unit_name, px_per_uni
     return outp, makespan, ideal, bubble
 
 
-def _legend_flow(t, u, plot_w):
+def _legend_flow(t, u, plot_w, extra_toks=()):
     """Shared horizontal legend layout -> (leg_pos, leg_rows)."""
-    toks = FWD_TOKENS + BWD_TOKENS
+    toks = FWD_TOKENS + BWD_TOKENS + list(extra_toks)
 
     def iw(tok):
-        return 13 + 6 + len(f"{LABEL[tok]} ({u(t[tok]):.2f}u)") * 6.0 + 22
+        return 13 + 6 + len(f"{LABEL[tok]} ({u(_ttime(t, tok)):.2f}u)") * 6.0 + 22
 
     wrap = max(plot_w + 6, 600.0)
     pos, lx, row = [], 0.0, 0
@@ -834,9 +989,14 @@ def _draw_legend(b, leg_pos, t, u, PAD, ly):
             f'<rect x="{x:.1f}" y="{yy - 10}" width="13" height="13" rx="2" '
             f'fill="{fill}" stroke="{stroke}"/>'
         )
+        if _is_rc(tok):
+            b.append(
+                f'<rect x="{x:.1f}" y="{yy - 10}" width="13" height="13" rx="2" '
+                f'fill="url(#rc)"/>'
+            )
         b.append(
             f'<text x="{x + 18:.1f}" y="{yy}" font-size="10.5" fill="#374151">'
-            f"{_esc(LABEL[tok])} ({u(t[tok]):.2f}u)</text>"
+            f"{_esc(LABEL[tok])} ({u(_ttime(t, tok)):.2f}u)</text>"
         )
 
 
@@ -852,10 +1012,12 @@ def render_overlap_svg(
     unit_name,
     px_per_unit,
     out,
+    extra_toks=(),
 ):
     """EP-overlap timeline: two lanes per pp stage — compute (top) + comm (bottom)
     — so hidden A2A shows as a comm box sitting under a compute box; exposed A2A
-    shows as a comm box over a compute gap. Bubble is measured on the comp lane."""
+    shows as a comm box over a compute gap. Bubble is measured on the comp lane.
+    ``extra_toks`` = recompute tokens to add to the legend."""
     p, v = layout.pp, layout.vpp
     ppu = px_per_unit / unit_ms
     PAD, LBL = 26, 112
@@ -871,7 +1033,7 @@ def render_overlap_svg(
     def u(ms):
         return ms / unit_ms
 
-    leg_pos, leg_rows = _legend_flow(t, u, plot_w)
+    leg_pos, leg_rows = _legend_flow(t, u, plot_w, extra_toks)
     height = grid_bot + 34 + leg_rows * 20 + PAD
 
     ideal = max(comp_busy) if comp_busy else 0.0
@@ -891,6 +1053,7 @@ def render_overlap_svg(
         f"a compute box = hidden, over a gap = exposed &#183; makespan {mk_u:.1f} u "
         f"({makespan:.0f} ms) &#183; overall bubble {bubble * 100:.1f}% (comp lane)</text>",
     ]
+    b.append(_HATCH_DEFS)
 
     # unit ticks
     raw = mk_u / 12 if mk_u else 1
@@ -956,6 +1119,11 @@ def render_overlap_svg(
             f"{'F' if n['kind'] == 'F' else 'B'} vs{n['vs']} pp{n['dev']} &#183; "
             f"{_esc(tok)} = {u(n['ms']):.2f} u ({n['ms']:.3f} ms)</title></rect>"
         )
+        if _is_rc(tok):  # hatch overlay marks a re-forward (recompute)
+            b.append(
+                f'<rect x="{x:.2f}" y="{ly0 + 2:.1f}" width="{max(w, 0.4):.2f}" '
+                f'height="{LANE_H - 4}" fill="url(#rc)"/>'
+            )
         if w >= 8:
             b.append(
                 f'<text x="{x + w / 2:.2f}" y="{ly0 + LANE_H / 2 + 3.2:.1f}" '
@@ -1002,6 +1170,18 @@ def parse_args():
         metavar="IDS",
         help="comma list of global transformer-layer ids that are DENSE "
         '(F,M forward); default "0". "none" = all MoE',
+    )
+    ap.add_argument(
+        "--recompute",
+        default="none",
+        metavar="SPEC",
+        help="fine-grained activation recomputation: which layers re-run which "
+        "parts (attn / mlp) at the head of their backward, drawn as hatched Fʳ/"
+        "Eʳ/Cʳ/Dʳ/Mʳ boxes. SPEC = TERM(;TERM)*, TERM = LAYERS[:PARTS]; LAYERS = "
+        "all | id | a-b (comma list); PARTS = all | attn | mlp (default both). "
+        'E.g. "all:attn,mlp"  "0-20:attn"  "all:mlp"  "3,5,7:attn;10-15:mlp". '
+        'default "none" (off). mlp recompute of a MoE layer re-runs its '
+        "dispatch/expert/combine (A2A on the comm lane, exposed).",
     )
     ap.add_argument(
         "--config",
@@ -1081,9 +1261,16 @@ if __name__ == "__main__":
     else:
         dense_set = {int(x) for x in args.dense_layers.split(",") if x.strip() != ""}
 
-    SEG_F, SEG_B = build_durations(layout, dense_set, t)
+    rc_map = parse_recompute(args.recompute, layout.num_layers)
+
+    SEG_F, SEG_B = build_durations(layout, dense_set, t, rc_map)
     dur_f = {vs: sum(ms for _, ms in segs) for vs, segs in SEG_F.items()}
     dur_b = {vs: sum(ms for _, ms in segs) for vs, segs in SEG_B.items()}
+    rc_extra = [
+        x
+        for x in RECOMP_ORDER
+        if any(tok == x for segs in SEG_B.values() for tok, _ in segs)
+    ]
 
     # unit anchor: 1 unit = --unit-ms, else the --unit phase's time
     if args.unit_ms is not None:
@@ -1104,6 +1291,13 @@ if __name__ == "__main__":
         f"pp={layout.pp}  vpp={layout.vpp}  layers={layout.num_layers}  "
         f"microbatches={args.m}  dense={sorted(dense_set) or 'none'}"
     )
+    if rc_map:
+        n_attn = sum(1 for p in rc_map.values() if "attn" in p)
+        n_mlp = sum(1 for p in rc_map.values() if "mlp" in p)
+        print(
+            f"recompute: {len(rc_map)} layer(s) — attn×{n_attn}, mlp×{n_mlp}  "
+            f"(spec {args.recompute!r})"
+        )
     print(f"unit 1 = {unit_name} = {unit_ms:.4f} ms")
     print("per-phase   ms      units   source")
     for tok in FWD_TOKENS + BWD_TOKENS:
@@ -1127,7 +1321,7 @@ if __name__ == "__main__":
 
     if args.ep_overlap:
         nodes, makespan, comp_busy, comm_busy = schedule_overlap(
-            layout, dense_set, t, args.m
+            layout, dense_set, t, args.m, rc_map
         )
         outp, mk, ideal, bubble = render_overlap_svg(
             nodes,
@@ -1141,6 +1335,7 @@ if __name__ == "__main__":
             unit_name,
             args.px_per_unit,
             args.svg,
+            rc_extra,
         )
         # serial reference (no overlap) to quantify the A2A hiding benefit
         _, ser_mk, _ = schedule_timed(layout.pp, layout.vpp, args.m, dur_f, dur_b)
@@ -1185,6 +1380,7 @@ if __name__ == "__main__":
             unit_name,
             args.px_per_unit,
             args.svg,
+            rc_extra,
         )
         print("-" * 74)
         print(
