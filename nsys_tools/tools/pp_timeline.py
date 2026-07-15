@@ -180,9 +180,13 @@ def parse_recompute(spec, num_layers):
         term = term.strip()
         if not term:
             continue
-        lsel, psel = (term.split(":", 1) + ["attn,mlp"])[:2] if ":" in term else (
-            term,
-            "attn,mlp",
+        lsel, psel = (
+            (term.split(":", 1) + ["attn,mlp"])[:2]
+            if ":" in term
+            else (
+                term,
+                "attn,mlp",
+            )
         )
         gids = set()
         for tok in lsel.split(","):
@@ -602,7 +606,10 @@ def _issue_fwd(comp, comm, op):
         comp.append(op["post"]["id"])
 
 
-def _issue_bwd(comp, comm, op):
+def _issue_bwd(comp, comm, op, defer_wgrad=False):
+    # defer_wgrad: keep weight-grads (E^W/F^W/M^W) off the critical comp stream —
+    # they have no downstream dep, so a zero-bubble schedule runs them later in the
+    # pipeline bubbles. Here we drop them from the makespan-determining path.
     if op["pre"]:
         comp.append(op["pre"]["id"])
     for L in op["layers"]:
@@ -611,18 +618,22 @@ def _issue_bwd(comp, comm, op):
         if L["combine_bwd"]:
             comm.append(L["combine_bwd"]["id"])
         comp.append(L["mlp_dgrad"]["id"])
-        comp.append(L["mlp_wgrad"]["id"])
+        if not defer_wgrad:
+            comp.append(L["mlp_wgrad"]["id"])
         if L["dispatch_bwd"]:
             comm.append(L["dispatch_bwd"]["id"])
         comp.append(L["attn_dgrad"]["id"])
-        comp.append(L["attn_wgrad"]["id"])
+        if not defer_wgrad:
+            comp.append(L["attn_wgrad"]["id"])
     if op["post"]:
         comp.append(op["post"]["id"])
 
 
-def _issue_combined(comp, comm, F, B):
+def _issue_combined(comp, comm, F, B, defer_wgrad=False):
     """Interleave a forward op F and backward op B per combined_1f1b.py so each
-    A2A comm node is issued alongside a compute node from the other direction."""
+    A2A comm node is issued alongside a compute node from the other direction.
+    ``defer_wgrad`` drops the weight-grads off the critical comp stream (zero-bubble
+    modeling — they run later in bubbles)."""
     if F["pre"]:
         comp.append(F["pre"]["id"])  # embedding fwd
     if B["pre"]:
@@ -637,12 +648,14 @@ def _issue_combined(comp, comm, F, B):
             for rn in bl["recomp"]:  # this layer's re-forward, before its grads
                 (comp if rn["stream"] == "comp" else comm).append(rn["id"])
             comp.append(bl["mlp_dgrad"]["id"])  # mlp_bwd (dgrad)
-            comp.append(bl["mlp_wgrad"]["id"])  # mlp_bwd (wgrad)
+            if not defer_wgrad:
+                comp.append(bl["mlp_wgrad"]["id"])  # mlp_bwd (wgrad)
         if fl:
             comp.append(fl["mlp"]["id"])  # mlp_fwd (expert)
         if bl:
             comp.append(bl["attn_dgrad"]["id"])  # attn_bwd (dgrad)
-            comp.append(bl["attn_wgrad"]["id"])  # attn_bwd (wgrad)
+            if not defer_wgrad:
+                comp.append(bl["attn_wgrad"]["id"])  # attn_bwd (wgrad)
         if bl and bl["combine_bwd"]:
             comm.append(bl["combine_bwd"]["id"])  # combine_bwd
         if fl and fl["dispatch"]:
@@ -657,7 +670,9 @@ def _issue_combined(comp, comm, F, B):
         comp.append(B["post"]["id"])  # embedding bwd
 
 
-def schedule_overlap(layout, dense_set, t, m, rc_map=None, mb_group=None, overlap=True):
+def schedule_overlap(
+    layout, dense_set, t, m, rc_map=None, mb_group=None, overlap=True, defer_wgrad=False
+):
     """Two-stream (comp/comm) combined-1F1B schedule with EP A2A overlap.
     Returns (nodes, makespan, comp_busy[d], comm_busy[d]); each node gets
     'start'/'end' (ms). Streams run in issue order; a node starts at
@@ -715,13 +730,13 @@ def schedule_overlap(layout, dense_set, t, m, rc_map=None, mb_group=None, overla
                 # attn_fwd greedily fills the pre-steady gap and detaches from its
                 # own dispatch (F far left of its D on the comp lane).
                 fop["first"]["preds"].extend(bop["first"]["preds"])
-                _issue_combined(comp_q[d], comm_q[d], fop, bop)
+                _issue_combined(comp_q[d], comm_q[d], fop, bop, defer_wgrad)
                 i += 2
             else:
                 if kind == "F":
                     _issue_fwd(comp_q[d], comm_q[d], fwd[(mb, vs)])
                 else:
-                    _issue_bwd(comp_q[d], comm_q[d], bwd[(mb, vs)])
+                    _issue_bwd(comp_q[d], comm_q[d], bwd[(mb, vs)], defer_wgrad)
                 i += 1
     # list-schedule: two in-order streams per device, cross-stream event deps
     by_id = {n["id"]: n for n in g.nodes}
@@ -791,7 +806,16 @@ _HATCH_DEFS = (
 
 
 def render_svg(
-    ops, makespan, busy, layout, m, t, unit_ms, unit_name, px_per_unit, out,
+    ops,
+    makespan,
+    busy,
+    layout,
+    m,
+    t,
+    unit_ms,
+    unit_name,
+    px_per_unit,
+    out,
     extra_toks=(),
 ):
     """All widths/labels are in UNITS (1 unit = unit_ms ms, the --unit phase).
