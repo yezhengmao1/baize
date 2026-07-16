@@ -819,6 +819,14 @@ def _stage_layer_label(layout, stage, chunk_id):
     return f"vpp{chunk_id} &#8594; {','.join(parts) or '-'}"
 
 
+def _stage_layer_line(layout, stage):
+    """One header row containing all VPP chunks owned by a PP stage."""
+    chunks = " &#183; ".join(
+        _stage_layer_label(layout, stage, c) for c in range(layout.vpp)
+    )
+    return f"pp {stage}: {chunks}"
+
+
 def _esc(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -870,13 +878,15 @@ def render_svg(
     ``extra_toks`` = recompute tokens to add to the legend."""
     p, v = layout.pp, layout.vpp
     ppu = px_per_unit / unit_ms  # px per ms (derived)
-    PAD, LBL = 26, 165
-    ROW_H, ROW_GAP = max(46, 38 + 10 * v), 16
+    PAD, LBL = 26, 96
+    ROW_H, ROW_GAP = 46, 16
     row_pitch = ROW_H + ROW_GAP
-    top = 100  # space for title + axis
+    stage_lines = [_stage_layer_line(layout, d) for d in range(p)]
+    top = 94 + p * 14  # title + summary + one layer-ownership row per PP stage
     x0 = PAD + LBL
     plot_w = makespan * ppu
-    width = x0 + plot_w + PAD
+    stage_w = max((len(line) * 6.2 for line in stage_lines), default=0.0)
+    width = max(x0 + plot_w + PAD, PAD + stage_w + PAD)
     grid_bot = top + p * row_pitch - ROW_GAP
 
     ideal = max(busy) if busy else 0.0
@@ -919,6 +929,11 @@ def render_svg(
         f"overall bubble {bubble * 100:.1f}%</text>",
     ]
     b.append(_HATCH_DEFS)
+    for d, line in enumerate(stage_lines):
+        b.append(
+            f'<text x="{PAD}" y="{72 + d * 14}" font-size="10.5" '
+            f'fill="#475569">{line}</text>'
+        )
 
     # time grid + axis ticks, in UNITS (~12 ticks)
     raw = mk_u / 12 if mk_u else 1
@@ -947,20 +962,15 @@ def render_svg(
         )
         row_bubble = (makespan - busy[d]) / makespan if makespan else 0.0
         b.append(
-            f'<text x="{PAD}" y="{ry + 12:.0f}" font-size="12.5" '
+            f'<text x="{PAD}" y="{ry + 15:.0f}" font-size="12.5" '
             f'font-weight="700" fill="#1b2733">pp {d}</text>'
         )
-        for c in range(v):
-            b.append(
-                f'<text x="{PAD}" y="{ry + 24 + c * 10:.0f}" font-size="8.5" '
-                f'fill="#475569">{_stage_layer_label(layout, d, c)}</text>'
-            )
         b.append(
-            f'<text x="{PAD}" y="{ry + 25 + v * 10:.0f}" font-size="9" '
+            f'<text x="{PAD}" y="{ry + 29:.0f}" font-size="10.5" '
             f'font-weight="700" fill="#b4530a">bubble {row_bubble * 100:.1f}%</text>'
         )
         b.append(
-            f'<text x="{PAD}" y="{ry + 33 + v * 10:.0f}" font-size="7" fill="#8a95a1">'
+            f'<text x="{PAD}" y="{ry + 41:.0f}" font-size="8" fill="#8a95a1">'
             f"busy {u(busy[d]):.0f}u</text>"
         )
 
@@ -1106,14 +1116,16 @@ def render_overlap_svg(
     ``extra_toks`` = recompute tokens to add to the legend."""
     p, v = layout.pp, layout.vpp
     ppu = px_per_unit / unit_ms
-    PAD, LBL = 26, 165
+    PAD, LBL = 26, 112
     LANE_H, LANE_GAP, ROW_GAP = 26, 3, 20
-    ROW_H = max(LANE_H * 2 + LANE_GAP, 35 + 10 * v)
+    ROW_H = LANE_H * 2 + LANE_GAP
     row_pitch = ROW_H + ROW_GAP
-    top = 104
+    stage_lines = [_stage_layer_line(layout, d) for d in range(p)]
+    top = 94 + p * 14  # title + summary + one layer-ownership row per PP stage
     x0 = PAD + LBL
     plot_w = makespan * ppu
-    width = x0 + plot_w + PAD
+    stage_w = max((len(line) * 6.2 for line in stage_lines), default=0.0)
+    width = max(x0 + plot_w + PAD, PAD + stage_w + PAD)
     grid_bot = top + p * row_pitch - ROW_GAP
 
     def u(ms):
@@ -1140,6 +1152,11 @@ def render_overlap_svg(
         f"({makespan:.0f} ms) &#183; overall bubble {bubble * 100:.1f}% (comp lane)</text>",
     ]
     b.append(_HATCH_DEFS)
+    for d, line in enumerate(stage_lines):
+        b.append(
+            f'<text x="{PAD}" y="{72 + d * 14}" font-size="10.5" '
+            f'fill="#475569">{line}</text>'
+        )
 
     # unit ticks
     raw = mk_u / 12 if mk_u else 1
@@ -1176,20 +1193,15 @@ def render_overlap_svg(
             )
         rb = (makespan - comp_busy[d]) / makespan if makespan else 0.0
         b.append(
-            f'<text x="{PAD}" y="{ry + 12:.0f}" font-size="12.5" '
+            f'<text x="{PAD}" y="{ry + 14:.0f}" font-size="12.5" '
             f'font-weight="700" fill="#1b2733">pp {d}</text>'
         )
-        for c in range(v):
-            b.append(
-                f'<text x="{PAD}" y="{ry + 24 + c * 10:.0f}" font-size="8.5" '
-                f'fill="#475569">{_stage_layer_label(layout, d, c)}</text>'
-            )
         b.append(
-            f'<text x="{PAD}" y="{ry + 25 + v * 10:.0f}" font-size="9" '
+            f'<text x="{PAD}" y="{ry + 28:.0f}" font-size="10.5" '
             f'font-weight="700" fill="#b4530a">bubble {rb * 100:.1f}%</text>'
         )
         b.append(
-            f'<text x="{PAD}" y="{ry + 33 + v * 10:.0f}" font-size="7" fill="#8a95a1">'
+            f'<text x="{PAD}" y="{ry + 40:.0f}" font-size="8" fill="#8a95a1">'
             f"comp {u(comp_busy[d]):.0f}u comm {u(comm_busy[d]):.0f}u</text>"
         )
 
