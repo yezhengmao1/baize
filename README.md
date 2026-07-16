@@ -17,12 +17,13 @@ Packaged as the installable `baize`, providing six console commands:
 | `gpu-shape` | Per-operator input-shape table over the post-warmup window (compute only) |
 | `gpu-exporter` | Export a step as Chrome/Perfetto trace JSON (multi-rank, wall-clock aligned) |
 | `gpu-groups` | Megatron parallel-group resolver (config-only, no profile): TP/SP/CP/DP/PP/EP |
-| `gpu-sched` | Op-level 1F1B pipeline-timeline SVG with MoE EP-A2A overlap (config-only, no profile) |
+| `sim-mcore-pp-sched` | Op-level 1F1B pipeline-timeline SVG with MoE EP-A2A overlap (config-only, no profile) |
+| `sim-dual-pp-sched` | DeepSeek DualPipe bidirectional pipeline-timeline SVG (config-only, no profile) |
 
 ## Install
 
 ```bash
-pip install -e .          # from the repo root; provides gpu-flame / gpu-comm / gpu-shape / gpu-exporter / gpu-groups / gpu-sched
+pip install -e .          # from the repo root; provides gpu-flame / gpu-comm / gpu-shape / gpu-exporter / gpu-groups / sim-mcore-pp-sched / sim-dual-pp-sched
 ```
 
 The commands are shims in `nsys_tools/cli.py`, equivalent to `python -m nsys_tools.tools.flamegraph …`.
@@ -108,7 +109,7 @@ gpu-groups --world 64 --tp 2 --pp 4 --ep 8 --rank 0 --svg /tmp/groups
 
 Args: `gpu-groups --world N --tp N --pp N --ep N [--sp N] [--cp N] [--etp N] [--order A-B-…] [--pp-layout …] [--rank R] [--csv OUT] [--svg OUT] [--gbs N] [--mbs N]`
 
-### gpu-sched — op-level 1F1B pipeline timeline with EP overlap (config-only)
+### sim-mcore-pp-sched — op-level 1F1B pipeline timeline with EP overlap (config-only)
 
 **No profile** — draws a unit-anchored, wall-clock-scaled **1F1B pipeline timeline** SVG where every forward/backward op of every microbatch is decomposed into its GPU sub-phases (forward **F** attn / **D** dispatch / **E** moe-mlp / **C** combine / **M** dense-mlp / **V** embedding / **L** lm-head; backward **Fᴰ/Fᵂ Eᴰ/Eᵂ Mᴰ/Mᵂ Dʸ Cʸ Vʸ Lʸ**), each box scaled by its value and the legend carrying per-phase unit times. The schedule order is Megatron's interleaved 1F1B (reuses `gpu-groups`' `PPLayout` + `_pp_program`), and **each pp rank's own bubble %** is printed on its stage row.
 
@@ -117,13 +118,13 @@ Args: `gpu-groups --world N --tp N --pp N --ep N [--sp N] [--cp N] [--etp N] [--
 Per-phase times are **params/config, no CSV**: built-in defaults, overridden by a `--config` JSON (keys = phase tokens, e.g. `{"F":1.4,"E":1.59,"E^D":1.9}`) and/or `--t-<phase>` flags (precedence `--t-*` > `--config` > default). `--dump-config` prints the effective times as ready-to-edit JSON.
 
 ```bash
-gpu-sched --pp 4 --pipeline-model-parallel-layout "Ett|tttttt|tttttt|tttttt|tttttt|tttttt|tttttt|tttL" \
+sim-mcore-pp-sched --pp 4 --pipeline-model-parallel-layout "Ett|tttttt|tttttt|tttttt|tttttt|tttttt|tttttt|tttL" \
           --microbatches 32 --svg /tmp/pp_timeline               # EP overlap on by default
-gpu-sched --pp 4 --pipeline-model-parallel-layout "…" --dump-config > times.json
-gpu-sched --pp 4 --pipeline-model-parallel-layout "…" --config times.json --svg /tmp/pp_timeline
+sim-mcore-pp-sched --pp 4 --pipeline-model-parallel-layout "…" --dump-config > times.json
+sim-mcore-pp-sched --pp 4 --pipeline-model-parallel-layout "…" --config times.json --svg /tmp/pp_timeline
 ```
 
-Args: `gpu-sched --pp N --pipeline-model-parallel-layout "DSL" [--microbatches N] [--unit PHASE] [--ep-overlap|--no-ep-overlap] [--dense-layers IDS] [--config times.json] [--t-F MS …] [--dump-config] [--px-per-unit PX] --svg OUT`
+Args: `sim-mcore-pp-sched --pp N --pipeline-model-parallel-layout "DSL" [--microbatches N] [--unit PHASE] [--ep-overlap|--no-ep-overlap] [--dense-layers IDS] [--config times.json] [--t-F MS …] [--dump-config] [--px-per-unit PX] --svg OUT`
 
 ## Dependencies
 

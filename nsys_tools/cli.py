@@ -28,5 +28,9 @@ def gpu_groups() -> None:
     runpy.run_module("nsys_tools.tools.parallel_groups", run_name="__main__")
 
 
-def gpu_sched() -> None:
-    runpy.run_module("nsys_tools.tools.pp_timeline", run_name="__main__")
+def sim_mcore_pp_sched() -> None:
+    runpy.run_module("nsys_tools.tools.mcore_pp_timeline", run_name="__main__")
+
+
+def sim_dual_pp_sched() -> None:
+    runpy.run_module("nsys_tools.tools.dual_pp_time", run_name="__main__")

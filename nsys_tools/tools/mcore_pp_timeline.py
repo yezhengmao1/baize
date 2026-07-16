@@ -1,4 +1,4 @@
-"""gpu-sched: op-level 1F1B pipeline timeline (interleaved/vpp) SVG.
+"""sim-mcore-pp-sched: op-level 1F1B pipeline timeline (interleaved/vpp) SVG.
 
 Unlike ``gpu-groups --gbs`` (which draws a *unit-time* F/B Gantt purely to show the
 schedule shape), this tool draws a **wall-clock-scaled** timeline where every
@@ -160,6 +160,39 @@ def _is_rc(tok):
 def _ttime(t, tok):
     """Per-box time; recompute tokens reuse their base forward time."""
     return t[_rc_base(tok)]
+
+
+def parse_dense_layers(spec, num_layers):
+    """Parse comma-separated global dense-layer ids.
+
+    Layer ids are zero-based. The CLI default is ``"0"`` (only the first
+    transformer layer is dense); ``none`` or an empty value makes every layer
+    MoE. Keeping the parser here lets both timeline tools interpret
+    the option identically.
+    """
+    spec = (spec or "none").strip()
+    if spec.lower() in ("", "none"):
+        return set()
+
+    dense = set()
+    try:
+        for token in spec.split(","):
+            token = token.strip()
+            if token:
+                dense.add(int(token))
+    except ValueError:
+        sys.exit(
+            f"--dense-layers {spec!r}: expected comma-separated zero-based "
+            'layer ids, e.g. "0,1,4" (or "none")'
+        )
+
+    invalid = sorted(layer for layer in dense if not 0 <= layer < num_layers)
+    if invalid:
+        sys.exit(
+            f"--dense-layers: layer ids {invalid} outside valid range "
+            f"0-{num_layers - 1}"
+        )
+    return dense
 
 
 def parse_recompute(spec, num_layers):
@@ -772,6 +805,20 @@ def schedule_overlap(
 
 
 # --- SVG rendering ------------------------------------------------------------
+def _stage_layer_label(layout, stage, chunk_id):
+    """Compact global-layer ownership label for one PP/VPP model chunk."""
+    chunk = layout.by_pp[stage][chunk_id]
+    ids = list(chunk["layers"])
+    parts = []
+    if "E" in chunk["chars"]:
+        parts.append("E")
+    if ids:
+        parts.append(f"L{ids[0]}-{ids[-1]}" if len(ids) > 1 else f"L{ids[0]}")
+    if "L" in chunk["chars"]:
+        parts.append("Loss")
+    return f"vpp{chunk_id} &#8594; {','.join(parts) or '-'}"
+
+
 def _esc(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -823,8 +870,8 @@ def render_svg(
     ``extra_toks`` = recompute tokens to add to the legend."""
     p, v = layout.pp, layout.vpp
     ppu = px_per_unit / unit_ms  # px per ms (derived)
-    PAD, LBL = 26, 96
-    ROW_H, ROW_GAP = 46, 16
+    PAD, LBL = 26, 165
+    ROW_H, ROW_GAP = max(46, 38 + 10 * v), 16
     row_pitch = ROW_H + ROW_GAP
     top = 100  # space for title + axis
     x0 = PAD + LBL
@@ -900,15 +947,20 @@ def render_svg(
         )
         row_bubble = (makespan - busy[d]) / makespan if makespan else 0.0
         b.append(
-            f'<text x="{PAD}" y="{ry + 15:.0f}" font-size="12.5" '
+            f'<text x="{PAD}" y="{ry + 12:.0f}" font-size="12.5" '
             f'font-weight="700" fill="#1b2733">pp {d}</text>'
         )
+        for c in range(v):
+            b.append(
+                f'<text x="{PAD}" y="{ry + 24 + c * 10:.0f}" font-size="8.5" '
+                f'fill="#475569">{_stage_layer_label(layout, d, c)}</text>'
+            )
         b.append(
-            f'<text x="{PAD}" y="{ry + 29:.0f}" font-size="10.5" '
+            f'<text x="{PAD}" y="{ry + 25 + v * 10:.0f}" font-size="9" '
             f'font-weight="700" fill="#b4530a">bubble {row_bubble * 100:.1f}%</text>'
         )
         b.append(
-            f'<text x="{PAD}" y="{ry + 41:.0f}" font-size="8" fill="#8a95a1">'
+            f'<text x="{PAD}" y="{ry + 33 + v * 10:.0f}" font-size="7" fill="#8a95a1">'
             f"busy {u(busy[d]):.0f}u</text>"
         )
 
@@ -1054,9 +1106,9 @@ def render_overlap_svg(
     ``extra_toks`` = recompute tokens to add to the legend."""
     p, v = layout.pp, layout.vpp
     ppu = px_per_unit / unit_ms
-    PAD, LBL = 26, 112
+    PAD, LBL = 26, 165
     LANE_H, LANE_GAP, ROW_GAP = 26, 3, 20
-    ROW_H = LANE_H * 2 + LANE_GAP
+    ROW_H = max(LANE_H * 2 + LANE_GAP, 35 + 10 * v)
     row_pitch = ROW_H + ROW_GAP
     top = 104
     x0 = PAD + LBL
@@ -1124,15 +1176,20 @@ def render_overlap_svg(
             )
         rb = (makespan - comp_busy[d]) / makespan if makespan else 0.0
         b.append(
-            f'<text x="{PAD}" y="{ry + 14:.0f}" font-size="12.5" '
+            f'<text x="{PAD}" y="{ry + 12:.0f}" font-size="12.5" '
             f'font-weight="700" fill="#1b2733">pp {d}</text>'
         )
+        for c in range(v):
+            b.append(
+                f'<text x="{PAD}" y="{ry + 24 + c * 10:.0f}" font-size="8.5" '
+                f'fill="#475569">{_stage_layer_label(layout, d, c)}</text>'
+            )
         b.append(
-            f'<text x="{PAD}" y="{ry + 28:.0f}" font-size="10.5" '
+            f'<text x="{PAD}" y="{ry + 25 + v * 10:.0f}" font-size="9" '
             f'font-weight="700" fill="#b4530a">bubble {rb * 100:.1f}%</text>'
         )
         b.append(
-            f'<text x="{PAD}" y="{ry + 40:.0f}" font-size="8" fill="#8a95a1">'
+            f'<text x="{PAD}" y="{ry + 33 + v * 10:.0f}" font-size="7" fill="#8a95a1">'
             f"comp {u(comp_busy[d]):.0f}u comm {u(comm_busy[d]):.0f}u</text>"
         )
 
@@ -1216,8 +1273,9 @@ def parse_args():
         "--dense-layers",
         default="0",
         metavar="IDS",
-        help="comma list of global transformer-layer ids that are DENSE "
-        '(F,M forward); default "0". "none" = all MoE',
+        help="comma-separated zero-based global transformer-layer ids that are "
+        'dense (F,M forward), e.g. "0,1,4"; default "0" (only the first '
+        'layer). "none" = all MoE',
     )
     ap.add_argument(
         "--recompute",
@@ -1304,10 +1362,7 @@ if __name__ == "__main__":
         sys.exit("--svg OUT is required (or pass --dump-config to just print times)")
     layout = PPLayout(args.pp, dsl=args.layout)
 
-    if args.dense_layers.strip().lower() in ("", "none"):
-        dense_set = set()
-    else:
-        dense_set = {int(x) for x in args.dense_layers.split(",") if x.strip() != ""}
+    dense_set = parse_dense_layers(args.dense_layers, layout.num_layers)
 
     rc_map = parse_recompute(args.recompute, layout.num_layers)
 
