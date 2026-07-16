@@ -76,6 +76,23 @@ gpu-comm rank*.sqlite --skip-steps 1 --sort slowness
 ```
 
 Args: `gpu-comm <db.sqlite>... [--step-nvtx SUBSTR] [--skip-steps N] [--p2p-dtype-bytes N] [--ep N] [--heatmap OUT] [--by-node] [--sort {slowness,id}] [--jobs N]`
+### gpu-deepep-skew — per-call DeepEP skew histograms
+
+Reports per-EP-group Dispatch/Combine totals. With --png OUT, it writes a
+two-row, two-column publication-style PNG. The left column overlays Total,
+True comm, and Skew time distributions; the right column shows every matched
+call ordered by Total time as a continuous percentile curve, with stacked
+True comm and Skew areas and a Total outline. Calls are matched across ranks by
+chronological GPU start time within each post-warmup analysis window (never by
+DeepEP sequence IDs).
+The 0.25 ms histogram bins and minor grid remain visible, while numeric time
+labels are dynamically spaced to approximately 6-8 labels over the full range.
+
+    gpu-deepep-skew rank*.sqlite --ep 8 --jobs 8 --png /tmp/deepep-skew
+
+Args: gpu-deepep-skew <db.sqlite>... [--ep N] [--world N] [--step-nvtx SUBSTR]
+[--skip-steps N] [--dtype-bytes N] [--per-rank] [--csv OUT] [--png OUT]
+[--hist-bins N] [--jobs N]
 
 ### gpu-shape — per-operator input-shape table
 

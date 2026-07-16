@@ -15,6 +15,7 @@ dependencies = [
 [project.scripts]
 gpu-flame = "nsys_tools.cli:gpu_flame"
 gpu-comm = "nsys_tools.cli:gpu_comm"
+gpu-deepep-skew = "nsys_tools.cli:gpu_deepep_skew"
 gpu-shape = "nsys_tools.cli:gpu_shape"
 gpu-exporter = "nsys_tools.cli:gpu_exporter"
 gpu-groups = "nsys_tools.cli:gpu_groups"

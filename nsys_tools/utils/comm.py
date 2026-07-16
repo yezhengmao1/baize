@@ -172,14 +172,21 @@ def _first_tensor_elems(text: str) -> int:
     return p if dims else 0
 
 
-def _deepep_volume(stack, dtype_bytes: int = 2) -> int:
-    """Token-payload bytes for a DeepEP kernel: first tensor of its enclosing
-    FusedDispatch/FusedCombine range × dtype_bytes. 0 if no such range is found."""
+def _deepep_frame(stack):
+    """Innermost enclosing FusedDispatch/FusedCombine NVTX frame, if present."""
     frame = None
     for e in stack:
         if _DEEPEP_RANGE_RE.match(e.name):
-            frame = e.name  # stack is longest-first; keep innermost match
-    return _first_tensor_elems(frame) * dtype_bytes if frame else 0
+            frame = e
+    return frame
+
+
+def _deepep_volume(stack, dtype_bytes: int = 2) -> int:
+    """Token-payload bytes for a DeepEP kernel: first tensor of its enclosing
+    FusedDispatch/FusedCombine range × dtype_bytes. 0 if no such range is found."""
+    frame = _deepep_frame(stack)
+    return _first_tensor_elems(frame.name) * dtype_bytes if frame else 0
+
 
 
 def parse_range(text: str):
@@ -206,6 +213,8 @@ class CommEvent(NamedTuple):
     gpu_start: int
     # the innermost non-plumbing enclosing NVTX scope (model phase)
     scope: str
+    # Rank-local identity of the enclosing logical DeepEP call. None for NCCL.
+    call_id: tuple[int, int] | None = None
 
 
 def _innermost_range(ranges_by_tid, tid, ts):
@@ -341,6 +350,20 @@ def _load_nccl(
     return events
 
 
+def load_deepep_in_window(
+    conn: sqlite3.Connection,
+    idx: NvtxIndex,
+    ws: int,
+    we: int,
+    dtype_bytes: int = 2,
+) -> list[CommEvent]:
+    """DeepEP-only CommEvents (Dispatch/Combine) whose kernel starts in [ws, we].
+
+    Same as load_comm_in_window but skips the NCCL path entirely — for tools that
+    only care about the MoE EP all-to-all (e.g. gpu-deepep-skew)."""
+    return _load_deepeps(conn, idx, ws, we, dtype_bytes)
+
+
 def _load_deepeps(
     conn: sqlite3.Connection,
     idx: NvtxIndex,
@@ -364,6 +387,7 @@ def _load_deepeps(
         nbytes = (
             _deepep_volume(stack, dtype_bytes) if name in ("dispatch", "combine") else 0
         )
+        frame = _deepep_frame(stack)
         out.append(
             CommEvent(
                 op=op,
@@ -375,6 +399,7 @@ def _load_deepeps(
                 gpu_dur=k["gpu_dur"],
                 gpu_start=k["gpu_start"],
                 scope=_scope_from_stack(stack),
+                call_id=(frame.start, frame.end) if frame else None,
             )
         )
     return out
