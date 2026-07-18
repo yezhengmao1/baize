@@ -24,6 +24,10 @@ def gpu_p2p_skew() -> None:
     runpy.run_module("nsys_tools.tools.gpu_p2p_skew", run_name="__main__")
 
 
+def gpu_allreduce_skew() -> None:
+    runpy.run_module("nsys_tools.tools.gpu_allreduce_skew", run_name="__main__")
+
+
 def gpu_shape() -> None:
     runpy.run_module("nsys_tools.tools.kernel_shapes", run_name="__main__")
 

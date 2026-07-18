@@ -15,6 +15,7 @@ Packaged as the installable `baize`, providing these console commands:
 | `gpu-flame` | Training step-boundary detection + per-step kernel→NVTX flame graph (Solo / Sum / Count / +idle; `--diff`) |
 | `gpu-comm` | Cross-rank communication report: NCCL collectives/P2P + DeepEP MoE all-to-all — volume / busbw / skew |
 | `gpu-p2p-skew` | Pair P2P GPU kernels through `P2p:commId` markers and plot start-time skew |
+| `gpu-allreduce-skew` | Match AllReduce kernels by communicator/sequence and plot group start-time skew |
 | `gpu-shape` | Per-operator input-shape table over the post-warmup window (compute only) |
 | `gpu-exporter` | Export a step as Chrome/Perfetto trace JSON (multi-rank, wall-clock aligned) |
 | `gpu-groups` | Megatron parallel-group resolver (config-only, no profile): TP/SP/CP/DP/PP/EP |
@@ -24,7 +25,7 @@ Packaged as the installable `baize`, providing these console commands:
 ## Install
 
 ```bash
-pip install -e .          # from repo root; provides gpu-flame / gpu-comm / gpu-p2p-skew / gpu-shape / gpu-exporter / gpu-groups / simulators
+pip install -e .          # from repo root; provides gpu-flame / gpu-comm / gpu-p2p-skew / gpu-allreduce-skew / gpu-shape / gpu-exporter / gpu-groups / simulators
 ```
 
 The commands are shims in `nsys_tools/cli.py`, equivalent to `python -m nsys_tools.tools.flamegraph …`.
@@ -107,6 +108,18 @@ aligned by their session UTC epoch when available.
     gpu-p2p-skew rank*.sqlite --png /tmp/p2p-skew --csv /tmp/p2p-skew
 
 Args: gpu-p2p-skew <db.sqlite>... [--png OUT] [--no-png] [--csv OUT]
+[--hist-bins N] [--no-align] [--jobs N]
+
+### gpu-allreduce-skew — AllReduce kernel-start skew histogram
+
+Matches `AllReduce:comm=...:seq=...` NVTX markers to their real
+`ncclDevKernel_AllReduce*` GPU kernels. For each complete communicator call,
+the sample is `max(rank kernel starts) - min(rank kernel starts)`. Profiles are
+UTC aligned when session metadata is available; incomplete calls are skipped.
+
+    gpu-allreduce-skew rank*.sqlite --png /tmp/allreduce-skew --csv /tmp/allreduce-skew
+
+Args: gpu-allreduce-skew <db.sqlite>... [--png OUT] [--no-png] [--csv OUT]
 [--hist-bins N] [--no-align] [--jobs N]
 
 ### gpu-shape — per-operator input-shape table
