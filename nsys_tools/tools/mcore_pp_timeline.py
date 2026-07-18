@@ -16,6 +16,11 @@ Phase legend (one colored box per sub-op):
 
 A transformer layer ('t') is MoE (F,D,E,C forward) unless its global id is in
 ``--dense-layers`` (F,M forward) — by default only layer 0, per the given model.
+An MTP layer ('m') re-embeds its shifted tokens before its transformer block, so
+it expands to V,F,D,E,C (or V,F,M when selected by ``--dense-mtp-layers``).
+The loss stage evaluates the main output plus every MTP depth, hence one layout
+``L`` expands to ``1 + number_of_m_layers`` L/L^ boxes.
+
 Per-phase times come from built-in DEFAULTS (a measured A3B-8EP-4PP run), overridden
 by a ``--config`` JSON (keys = phase tokens, e.g. {"F": 1.4, "E^D": 1.9}) and/or the
 per-phase ``--t-<phase>`` CLI flags.  Precedence: ``--t-*`` flag > ``--config`` >
@@ -195,6 +200,53 @@ def parse_dense_layers(spec, num_layers):
     return dense
 
 
+def parse_dense_mtp_layers(spec, num_mtp_layers):
+    """Parse zero-based MTP depths whose transformer FFN is dense.
+
+    Megatron GPT normally mirrors the final decoder layer for every MTP depth;
+    for an MoE final decoder layer that means all MTP depths are MoE. The
+    selector exists for custom layer specs which intentionally mix dense/MoE
+    MTP depths. It is separate from --dense-layers because layout m entries do
+    not consume global transformer-layer ids.
+    """
+    spec = (spec or "none").strip()
+    if spec.lower() in ("", "none"):
+        return set()
+    try:
+        dense = {int(tok.strip()) for tok in spec.split(",") if tok.strip()}
+    except ValueError:
+        sys.exit(
+            f"--dense-mtp-layers {spec!r}: expected comma-separated zero-based "
+            'MTP depth ids, e.g. "0" (or "none")'
+        )
+    invalid = sorted(depth for depth in dense if not 0 <= depth < num_mtp_layers)
+    if invalid:
+        sys.exit(
+            f"--dense-mtp-layers: depth ids {invalid} outside valid range "
+            f"0-{num_mtp_layers - 1}"
+        )
+    return dense
+
+
+def _num_mtp_layers(layout):
+    return sum(
+        chunk["chars"].count("m")
+        for stage_chunks in layout.by_pp
+        for chunk in stage_chunks
+    )
+
+
+def _mtp_depth_offset(layout, stage, chunk_id):
+    """First global MTP depth in a chunk, following layout's VPP-major order."""
+    depth = 0
+    for c in range(layout.vpp):
+        for d in range(layout.pp):
+            if d == stage and c == chunk_id:
+                return depth
+            depth += layout.by_pp[d][c]["chars"].count("m")
+    raise IndexError((stage, chunk_id))
+
+
 def parse_recompute(spec, num_layers):
     """Parse a fine-grained recompute selector into {global_layer_id: {parts}}.
 
@@ -313,36 +365,53 @@ def _flag(tok):
 
 
 # --- per-chunk sub-phase decomposition ---------------------------------------
-def chunk_segments(chunk, dense_set, t, rc_map=None):
-    """(fwd_segs, bwd_segs) for one layout chunk = lists of (token, ms).
+def chunk_segments(
+    chunk,
+    dense_set,
+    t,
+    rc_map=None,
+    mtp_dense_set=None,
+    mtp_offset=0,
+    num_mtp_layers=0,
+):
+    """Return forward/backward phase boxes for one layout chunk.
 
-    Forward walks the chunk's chars in order (E, layers, L); backward is the exact
-    reverse computation (L^, layers reversed, V^), each layer emitting its grads.
-    ``rc_map`` (global-layer-id -> {parts}) prepends recompute (re-forward) tokens
-    to a layer's backward before its grads.
+    Every m depth owns an embedding/projection phase V before its transformer
+    block. One layout L evaluates the main output plus all MTP outputs.
     """
     rc_map = rc_map or {}
+    mtp_dense_set = mtp_dense_set or set()
     fwd, layers_seq = [], []
     lids = list(chunk["layers"])
     li = 0
+    mtp_depth = mtp_offset
     for c in chunk["chars"]:
         if c == "E":
             fwd.append(("V", t["V"]))
         elif c == "L":
-            fwd.append(("L", t["L"]))
+            fwd.extend([("L", t["L"])] * (1 + num_mtp_layers))
         elif c in ("t", "m"):
-            gid = lids[li] if li < len(lids) else None
-            li += 1
-            dense = gid in dense_set
-            layers_seq.append((dense, gid))
+            is_mtp = c == "m"
+            if is_mtp:
+                gid = None
+                dense = mtp_depth in mtp_dense_set
+                depth = mtp_depth
+                mtp_depth += 1
+                fwd.append(("V", t["V"]))
+            else:
+                gid = lids[li]
+                li += 1
+                dense = gid in dense_set
+                depth = None
+            layers_seq.append((dense, gid, is_mtp, depth))
             if dense:
                 fwd += [("F", t["F"]), ("M", t["M"])]
             else:
                 fwd += [("F", t["F"]), ("D", t["D"]), ("E", t["E"]), ("C", t["C"])]
     bwd = []
     if any(c == "L" for c in chunk["chars"]):
-        bwd.append(("L^", t["L^"]))
-    for dense, gid in reversed(layers_seq):
+        bwd.extend([("L^", t["L^"])] * (1 + num_mtp_layers))
+    for dense, gid, is_mtp, _depth in reversed(layers_seq):
         if gid in rc_map:
             for tok in recompute_tokens(rc_map[gid], not dense):
                 bwd.append((tok + "~", t[tok]))
@@ -362,20 +431,29 @@ def chunk_segments(chunk, dense_set, t, rc_map=None):
                 ("F^D", t["F^D"]),
                 ("F^W", t["F^W"]),
             ]
+        if is_mtp:
+            bwd.append(("V^", t["V^"]))
     if any(c == "E" for c in chunk["chars"]):
         bwd.append(("V^", t["V^"]))
     return fwd, bwd
 
 
-def build_durations(layout, dense_set, t, rc_map=None):
-    """Per virtual-stage vs = chunk*pp + pp_rank: (fwd_segs, bwd_segs).
-
-    layout.by_pp[d][c] is pp-rank d's vpp-chunk c (vpp-major id = c*pp + d)."""
+def build_durations(layout, dense_set, t, rc_map=None, mtp_dense_set=None):
+    """Per virtual-stage vs = chunk*pp + pp_rank: (fwd_segs, bwd_segs)."""
     p, v = layout.pp, layout.vpp
+    num_mtp_layers = _num_mtp_layers(layout)
     seg_f, seg_b = {}, {}
     for c in range(v):
         for d in range(p):
-            fwd, bwd = chunk_segments(layout.by_pp[d][c], dense_set, t, rc_map)
+            fwd, bwd = chunk_segments(
+                layout.by_pp[d][c],
+                dense_set,
+                t,
+                rc_map,
+                mtp_dense_set,
+                _mtp_depth_offset(layout, d, c),
+                num_mtp_layers,
+            )
             seg_f[c * p + d] = fwd
             seg_b[c * p + d] = bwd
     return seg_f, seg_b
@@ -480,29 +558,40 @@ class _NodeGen:
         return n
 
 
-def _chunk_layer_dense(chunk, dense_set):
-    """List of per-'t'-layer (dense_flag, global_id), in written (forward) order."""
+def _chunk_layer_dense(chunk, dense_set, mtp_dense_set=None, mtp_offset=0):
+    """Return (dense, global_decoder_id, is_mtp, mtp_depth) in forward order."""
+    mtp_dense_set = mtp_dense_set or set()
     out, lids, li = [], list(chunk["layers"]), 0
+    mtp_depth = mtp_offset
     for ch in chunk["chars"]:
-        if ch in ("t", "m"):
-            gid = lids[li] if li < len(lids) else None
+        if ch == "t":
+            gid = lids[li]
             li += 1
-            out.append((gid in dense_set, gid))
+            out.append((gid in dense_set, gid, False, None))
+        elif ch == "m":
+            out.append((mtp_depth in mtp_dense_set, None, True, mtp_depth))
+            mtp_depth += 1
     return out
 
 
-def _fwd_op(g, mb, vs, layout, dense_set, t):
+def _fwd_op(g, mb, vs, layout, dense_set, t, mtp_dense_set=None):
     d = vs % layout.pp
-    chunk = layout.by_pp[d][vs // layout.pp]
+    chunk_id = vs // layout.pp
+    chunk = layout.by_pp[d][chunk_id]
     has_E = any(c == "E" for c in chunk["chars"])
     has_L = any(c == "L" for c in chunk["chars"])
+    num_mtp_layers = _num_mtp_layers(layout)
     pre = g.mk("V", "comp", t["V"], mb, vs, "F", d) if has_E else None
     layers = []
-    for dense, gid in _chunk_layer_dense(chunk, dense_set):
+    layer_info = _chunk_layer_dense(
+        chunk, dense_set, mtp_dense_set, _mtp_depth_offset(layout, d, chunk_id)
+    )
+    for dense, gid, is_mtp, _depth in layer_info:
         if dense:
             layers.append(
                 {
                     "moe": False,
+                    "mtp_pre": g.mk("V", "comp", t["V"], mb, vs, "F", d) if is_mtp else None,
                     "attn": g.mk("F", "comp", t["F"], mb, vs, "F", d),
                     "mlp": g.mk("M", "comp", t["M"], mb, vs, "F", d),
                     "dispatch": None,
@@ -513,17 +602,26 @@ def _fwd_op(g, mb, vs, layout, dense_set, t):
             layers.append(
                 {
                     "moe": True,
+                    "mtp_pre": g.mk("V", "comp", t["V"], mb, vs, "F", d) if is_mtp else None,
                     "attn": g.mk("F", "comp", t["F"], mb, vs, "F", d),
                     "dispatch": g.mk("D", "comm", t["D"], mb, vs, "F", d),
                     "mlp": g.mk("E", "comp", t["E"], mb, vs, "F", d),
                     "combine": g.mk("C", "comm", t["C"], mb, vs, "F", d),
                 }
             )
-    post = g.mk("L", "comp", t["L"], mb, vs, "F", d) if has_L else None
+    post = (
+        g.mk("L", "comp", t["L"] * (1 + num_mtp_layers), mb, vs, "F", d)
+        if has_L
+        else None
+    )
     # data deps along the activation path: (V) -> attn->disp->mlp->comb -> ... -> (L)
     prev = pre
     for L in layers:
-        if prev:
+        if L["mtp_pre"]:
+            if prev:
+                L["mtp_pre"]["preds"].append(prev["id"])
+            L["attn"]["preds"].append(L["mtp_pre"]["id"])
+        elif prev:
             L["attn"]["preds"].append(prev["id"])
         if L["moe"]:
             L["dispatch"]["preds"].append(L["attn"]["id"])
@@ -534,21 +632,31 @@ def _fwd_op(g, mb, vs, layout, dense_set, t):
             L["mlp"]["preds"].append(L["attn"]["id"])
             prev = L["mlp"]
     if post:
-        post["preds"].append(prev["id"])
+        if prev:
+            post["preds"].append(prev["id"])
         prev = post
-    first = pre or layers[0]["attn"]
+    first = pre or (layers[0]["mtp_pre"] or layers[0]["attn"] if layers else post)
     return {"layers": layers, "pre": pre, "post": post, "first": first, "last": prev}
 
 
-def _bwd_op(g, mb, vs, layout, dense_set, t, rc_map=None):
+def _bwd_op(g, mb, vs, layout, dense_set, t, rc_map=None, mtp_dense_set=None):
     rc_map = rc_map or {}
     d = vs % layout.pp
-    chunk = layout.by_pp[d][vs // layout.pp]
+    chunk_id = vs // layout.pp
+    chunk = layout.by_pp[d][chunk_id]
     has_E = any(c == "E" for c in chunk["chars"])
     has_L = any(c == "L" for c in chunk["chars"])
-    pre = g.mk("L^", "comp", t["L^"], mb, vs, "B", d) if has_L else None
+    num_mtp_layers = _num_mtp_layers(layout)
+    pre = (
+        g.mk("L^", "comp", t["L^"] * (1 + num_mtp_layers), mb, vs, "B", d)
+        if has_L
+        else None
+    )
     layers = []
-    for dense, gid in reversed(_chunk_layer_dense(chunk, dense_set)):
+    layer_info = _chunk_layer_dense(
+        chunk, dense_set, mtp_dense_set, _mtp_depth_offset(layout, d, chunk_id)
+    )
+    for dense, gid, is_mtp, _depth in reversed(layer_info):
         # recompute (re-forward) nodes for this layer, in forward order; the MoE
         # feed-forward recompute rides the comm stream for its A2A but is chained
         # (serial re-forward, so it stays exposed, not hidden under other compute)
@@ -562,6 +670,7 @@ def _bwd_op(g, mb, vs, layout, dense_set, t, rc_map=None):
             layers.append(
                 {
                     "moe": False,
+                    "mtp_post": g.mk("V^", "comp", t["V^"], mb, vs, "B", d) if is_mtp else None,
                     "recomp": recomp,
                     "combine_bwd": None,
                     "dispatch_bwd": None,
@@ -575,6 +684,7 @@ def _bwd_op(g, mb, vs, layout, dense_set, t, rc_map=None):
             layers.append(
                 {
                     "moe": True,
+                    "mtp_post": g.mk("V^", "comp", t["V^"], mb, vs, "B", d) if is_mtp else None,
                     "recomp": recomp,
                     "combine_bwd": g.mk("C^", "comm", t["C^"], mb, vs, "B", d),
                     "mlp_dgrad": g.mk("E^D", "comp", t["E^D"], mb, vs, "B", d),
@@ -614,6 +724,9 @@ def _bwd_op(g, mb, vs, layout, dense_set, t, rc_map=None):
             L["attn_dgrad"]["preds"].append(L["mlp_dgrad"]["id"])
             L["attn_wgrad"]["preds"].append(L["attn_dgrad"]["id"])
             prev = L["attn_dgrad"]
+        if L["mtp_post"]:
+            L["mtp_post"]["preds"].append(L["attn_dgrad"]["id"])
+            prev = L["mtp_post"]
     if post:
         post["preds"].append(prev["id"])
         prev = post
@@ -629,6 +742,8 @@ def _issue_fwd(comp, comm, op):
     if op["pre"]:
         comp.append(op["pre"]["id"])
     for L in op["layers"]:
+        if L["mtp_pre"]:
+            comp.append(L["mtp_pre"]["id"])
         comp.append(L["attn"]["id"])
         if L["dispatch"]:
             comm.append(L["dispatch"]["id"])
@@ -658,6 +773,8 @@ def _issue_bwd(comp, comm, op, defer_wgrad=False):
         comp.append(L["attn_dgrad"]["id"])
         if not defer_wgrad:
             comp.append(L["attn_wgrad"]["id"])
+        if L["mtp_post"]:
+            comp.append(L["mtp_post"]["id"])
     if op["post"]:
         comp.append(op["post"]["id"])
 
@@ -676,6 +793,8 @@ def _issue_combined(comp, comm, F, B, defer_wgrad=False):
         fl = F["layers"][i] if i < nf else None
         bl = B["layers"][i] if i < nb else None
         if fl:
+            if fl["mtp_pre"]:
+                comp.append(fl["mtp_pre"]["id"])  # MTP embedding/projection
             comp.append(fl["attn"]["id"])  # attn_fwd
         if bl:
             for rn in bl["recomp"]:  # this layer's re-forward, before its grads
@@ -689,6 +808,8 @@ def _issue_combined(comp, comm, F, B, defer_wgrad=False):
             comp.append(bl["attn_dgrad"]["id"])  # attn_bwd (dgrad)
             if not defer_wgrad:
                 comp.append(bl["attn_wgrad"]["id"])  # attn_bwd (wgrad)
+            if bl["mtp_post"]:
+                comp.append(bl["mtp_post"]["id"])  # MTP embedding/projection bwd
         if bl and bl["combine_bwd"]:
             comm.append(bl["combine_bwd"]["id"])  # combine_bwd
         if fl and fl["dispatch"]:
@@ -704,7 +825,15 @@ def _issue_combined(comp, comm, F, B, defer_wgrad=False):
 
 
 def schedule_overlap(
-    layout, dense_set, t, m, rc_map=None, mb_group=None, overlap=True, defer_wgrad=False
+    layout,
+    dense_set,
+    t,
+    m,
+    rc_map=None,
+    mb_group=None,
+    overlap=True,
+    defer_wgrad=False,
+    mtp_dense_set=None,
 ):
     """Two-stream (comp/comm) combined-1F1B schedule with EP A2A overlap.
     Returns (nodes, makespan, comp_busy[d], comm_busy[d]); each node gets
@@ -718,12 +847,14 @@ def schedule_overlap(
     V = p * v
     g = _NodeGen()
     fwd = {
-        (mb, vs): _fwd_op(g, mb, vs, layout, dense_set, t)
+        (mb, vs): _fwd_op(g, mb, vs, layout, dense_set, t, mtp_dense_set)
         for vs in range(V)
         for mb in range(m)
     }
     bwd = {
-        (mb, vs): _bwd_op(g, mb, vs, layout, dense_set, t, rc_map)
+        (mb, vs): _bwd_op(
+            g, mb, vs, layout, dense_set, t, rc_map, mtp_dense_set
+        )
         for vs in range(V)
         for mb in range(m)
     }
@@ -814,8 +945,11 @@ def _stage_layer_label(layout, stage, chunk_id):
         parts.append("E")
     if ids:
         parts.append(f"L{ids[0]}-{ids[-1]}" if len(ids) > 1 else f"L{ids[0]}")
+    mtp_here = chunk["chars"].count("m")
+    if mtp_here:
+        parts.append(f"MTPx{mtp_here}")
     if "L" in chunk["chars"]:
-        parts.append("Loss")
+        parts.append(f"Lossx{1 + _num_mtp_layers(layout)}")
     return f"vpp{chunk_id} &#8594; {','.join(parts) or '-'}"
 
 
@@ -1290,6 +1424,14 @@ def parse_args():
         'layer). "none" = all MoE',
     )
     ap.add_argument(
+        "--dense-mtp-layers",
+        default="none",
+        metavar="IDS",
+        help="comma-separated zero-based MTP depths using a dense FFN. Default "
+        "'none' mirrors this profile: both MTP depths are MoE. Use '0' only "
+        "for a custom first-dense/second-MoE MTP spec.",
+    )
+    ap.add_argument(
         "--recompute",
         default="none",
         metavar="SPEC",
@@ -1375,10 +1517,14 @@ if __name__ == "__main__":
     layout = PPLayout(args.pp, dsl=args.layout)
 
     dense_set = parse_dense_layers(args.dense_layers, layout.num_layers)
+    num_mtp_layers = _num_mtp_layers(layout)
+    mtp_dense_set = parse_dense_mtp_layers(args.dense_mtp_layers, num_mtp_layers)
 
     rc_map = parse_recompute(args.recompute, layout.num_layers)
 
-    SEG_F, SEG_B = build_durations(layout, dense_set, t, rc_map)
+    SEG_F, SEG_B = build_durations(
+        layout, dense_set, t, rc_map, mtp_dense_set
+    )
     dur_f = {vs: sum(ms for _, ms in segs) for vs, segs in SEG_F.items()}
     dur_b = {vs: sum(ms for _, ms in segs) for vs, segs in SEG_B.items()}
     rc_extra = [
@@ -1404,7 +1550,8 @@ if __name__ == "__main__":
     print("=" * 74)
     print(
         f"pp={layout.pp}  vpp={layout.vpp}  layers={layout.num_layers}  "
-        f"microbatches={args.m}  dense={sorted(dense_set) or 'none'}"
+        f"microbatches={args.m}  dense={sorted(dense_set) or 'none'}  "
+        f"mtp={num_mtp_layers}  mtp_dense={sorted(mtp_dense_set) or 'none'}"
     )
     if rc_map:
         n_attn = sum(1 for p in rc_map.values() if "attn" in p)
@@ -1436,7 +1583,12 @@ if __name__ == "__main__":
 
     if args.ep_overlap:
         nodes, makespan, comp_busy, comm_busy = schedule_overlap(
-            layout, dense_set, t, args.m, rc_map
+            layout,
+            dense_set,
+            t,
+            args.m,
+            rc_map,
+            mtp_dense_set=mtp_dense_set,
         )
         outp, mk, ideal, bubble = render_overlap_svg(
             nodes,
