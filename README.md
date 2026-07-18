@@ -8,12 +8,13 @@ NVIDIA Nsight Systems performance-analysis toolkit.
 
 Analyzes `.nsys-rep` profiles (exported to SQLite) with **kernels as the primary entity**: NVTX context is always attached through the **kernel → NVTX mapping**, never by querying `NVTX_EVENTS` as an independent first-class table.
 
-Packaged as the installable `baize`, providing six console commands:
+Packaged as the installable `baize`, providing these console commands:
 
 | Command | Purpose |
 |---|---|
 | `gpu-flame` | Training step-boundary detection + per-step kernel→NVTX flame graph (Solo / Sum / Count / +idle; `--diff`) |
 | `gpu-comm` | Cross-rank communication report: NCCL collectives/P2P + DeepEP MoE all-to-all — volume / busbw / skew |
+| `gpu-p2p-skew` | Pair P2P GPU kernels through `P2p:commId` markers and plot start-time skew |
 | `gpu-shape` | Per-operator input-shape table over the post-warmup window (compute only) |
 | `gpu-exporter` | Export a step as Chrome/Perfetto trace JSON (multi-rank, wall-clock aligned) |
 | `gpu-groups` | Megatron parallel-group resolver (config-only, no profile): TP/SP/CP/DP/PP/EP |
@@ -23,7 +24,7 @@ Packaged as the installable `baize`, providing six console commands:
 ## Install
 
 ```bash
-pip install -e .          # from the repo root; provides gpu-flame / gpu-comm / gpu-shape / gpu-exporter / gpu-groups / sim-mcore-pp-sched / sim-dual-pp-sched
+pip install -e .          # from repo root; provides gpu-flame / gpu-comm / gpu-p2p-skew / gpu-shape / gpu-exporter / gpu-groups / simulators
 ```
 
 The commands are shims in `nsys_tools/cli.py`, equivalent to `python -m nsys_tools.tools.flamegraph …`.
@@ -93,6 +94,20 @@ labels are dynamically spaced to approximately 6-8 labels over the full range.
 Args: gpu-deepep-skew <db.sqlite>... [--ep N] [--world N] [--step-nvtx SUBSTR]
 [--skip-steps N] [--dtype-bytes N] [--per-rank] [--csv OUT] [--png OUT]
 [--hist-bins N] [--jobs N]
+
+### gpu-p2p-skew — P2P kernel-start skew histogram
+
+Finds `P2p:commId=...` NVTX markers and matches them by occurrence to
+`*LaunchKernel*` APIs on the same CPU thread and in the same enclosing NVTX
+stack, then follows `correlationId` to the real GPU kernel start/end timestamps.
+Endpoints are paired by `(commId, seq, unordered rank pair)`, and the histogram
+contains `abs(start_a - start_b)` for every complete pair. Multiple profiles are
+aligned by their session UTC epoch when available.
+
+    gpu-p2p-skew rank*.sqlite --png /tmp/p2p-skew --csv /tmp/p2p-skew
+
+Args: gpu-p2p-skew <db.sqlite>... [--png OUT] [--no-png] [--csv OUT]
+[--hist-bins N] [--no-align] [--jobs N]
 
 ### gpu-shape — per-operator input-shape table
 
