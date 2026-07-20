@@ -195,10 +195,46 @@ LABELS = {
         "Solo view — widths ∝ Σ per-kernel solo time (GPU active_count == 1; the "
         "portion that actually blocks the GPU clock)"
     ),
+    "COUNT_H2": (
+        "Count view — widths &prop; number of GPU activities (kernel launches + "
+        "memcpy/memset); tooltip shows count and % of launches. Compare against "
+        "Sum to spot many-tiny-kernel overhead (wide here, narrow in Sum)"
+    ),
+    "IDLE_H2": (
+        "Sum + idle attribution — same as Sum, plus GPU-idle gaps added as "
+        "magenta <span style=\"color:#c0c\">&lt;idle&gt;</span> leaves under the "
+        "NVTX scope that enclosed each gap (which phase the GPU stalled in)"
+    ),
     "V1NAME": "sum",
     "V2NAME": "solo",
     "DIFFNAME": "overlap ratio",
     "DIFFFORMULA": "(1 - solo/sum)",
+}
+
+DIFF_LABELS = {
+    "LEGEND": (
+        '\n  <span class="sw" style="background:hsl(2,75%,55%)"></span> grew '
+        '(after − before is positive) &nbsp; '
+        '<span class="sw" style="background:hsl(0,0%,92%)"></span> unchanged '
+        '&nbsp; <span class="sw" style="background:hsl(212,75%,55%)"></span> '
+        "shrank (after − before is negative)\n"
+    ),
+    "NOTE": (
+        "\n  This is the same renderer and hierarchy as the normal flame graph. "
+        "Widths are absolute leaf changes rolled up through the tree; colors "
+        "encode signed <b>after − before</b>. Red grew, blue shrank.<br>\n"
+        "  <b>Solo / Sum / Count / Sum + idle</b> have the same positions and "
+        "interactions as the normal flame graph. Tooltips show the displayed "
+        "change magnitude and signed net delta.\n"
+    ),
+    "VIEW1_H2": "Sum view — widths ∝ rolled-up |Δ GPU-activity time|; color = signed Δ",
+    "VIEW2_H2": "Solo view — widths ∝ rolled-up |Δ per-activity solo time|; color = signed Δ",
+    "COUNT_H2": "Count view — widths ∝ rolled-up |Δ GPU activity count| per step; color = signed Δ",
+    "IDLE_H2": "Sum + idle attribution — widths ∝ rolled-up |Δ activity or idle time| by enclosing scope; color = signed Δ",
+    "V1NAME": "sum diff",
+    "V2NAME": "solo diff",
+    "DIFFNAME": "net delta",
+    "DIFFFORMULA": "(after - before)",
 }
 
 
@@ -232,16 +268,10 @@ def write_html(
 
 # =============================================================================
 # Differential flame graph (compare two stack trees: baseline vs current) —
-# four Diff-only views (Solo/Sum/Count/Sum+idle). The merged tree still carries
-# both sides for delta tooltips, but only one set of charts is rendered.
+# four Diff-only views (Solo/Sum/Count/Sum+idle). Widths are absolute leaf
+# deltas rolled up through the hierarchy; colors use signed net deltas.
 
 # =============================================================================
-
-_DIFF_TEMPLATE_PATH = (
-    Path(__file__).resolve().parent.parent / "templates" / "flamegraph_diff.html"
-)
-FLAMEGRAPH_DIFF_HTML_TEMPLATE = _DIFF_TEMPLATE_PATH.read_text()
-
 
 def _merge_metrics_json(
     a: "StackNode | None",
@@ -249,46 +279,106 @@ def _merge_metrics_json(
     scale_a: float,
     scale_b: float,
 ) -> dict:
-    """Merge aligned trees A (baseline) + B (current), carrying ALL metrics of
-    each side (sum / solo / count, per-step scaled) so the client can diff every
-    view (Solo / Sum / Count / Sum+idle). Every frame in either tree appears once.
+    """Build a compact, server-side precomputed Diff tree.
+
+    ``d`` is the signed after-before delta. Leaf ``v`` values are ``abs(d)``;
+    internal ``v`` values sum their children, preserving the additive hierarchy
+    required by an ordinary flame graph. Both arrays use (sum, solo, count) order.
     """
     ref = a if a is not None else b
     assert ref is not None
     label = frame_tag(ref.name, ref.kind) if ref.kind != "root" else "all"
 
-    def side(node: "StackNode | None", s: float) -> dict:
+    def metrics(node: "StackNode | None", scale: float) -> tuple[float, float, float]:
         if node is None:
-            return {"sum": 0.0, "solo": 0.0, "count": 0.0}
-        return {
-            "sum": node.value * s,
-            "solo": node.solo_value * s,
-            "count": node.count * s,
-        }
+            return (0.0, 0.0, 0.0)
+        return (node.value * scale, node.solo_value * scale, node.count * scale)
 
-    node = {"name": label, "kind": ref.kind, "a": side(a, scale_a), "b": side(b, scale_b)}
+    av = metrics(a, scale_a)
+    bv = metrics(b, scale_b)
+    delta = tuple(bv[i] - av[i] for i in range(3))
+    node = {"n": label, "k": ref.kind, "d": delta}
 
     keys: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for src in (a, b):
         if src is not None:
-            for k in src.children:
-                if k not in seen:
-                    seen.add(k)
-                    keys.append(k)
+            for key in src.children:
+                if key not in seen:
+                    seen.add(key)
+                    keys.append(key)
     if keys:
         children = [
             _merge_metrics_json(
-                a.children.get(k) if a is not None else None,
-                b.children.get(k) if b is not None else None,
+                a.children.get(key) if a is not None else None,
+                b.children.get(key) if b is not None else None,
                 scale_a,
                 scale_b,
             )
-            for k in keys
+            for key in keys
         ]
-        children.sort(key=lambda n: -max(n["a"]["sum"], n["b"]["sum"]))
-        node["children"] = children
+        children.sort(key=lambda child: -child["v"][0])
+        node["c"] = children
+        node["v"] = tuple(
+            sum(child["v"][i] for child in children) for i in range(3)
+        )
+    else:
+        node["v"] = tuple(abs(value) for value in delta)
     return node
+
+
+def _count_diff_nodes(root: dict) -> int:
+    return 1 + sum(_count_diff_nodes(child) for child in root.get("c", ()))
+
+
+def _prune_diff_tree(root: dict, min_fraction: float) -> tuple[int, int]:
+    """Prune insignificant Diff subtrees and aggregate them per parent.
+
+    A child is retained when its rolled-up magnitude reaches ``min_fraction``
+    of the root magnitude in at least one of (sum, solo, count). Removed siblings
+    become one ``<other diff>`` leaf, preserving both displayed widths and signed
+    net deltas exactly.
+    """
+    before = _count_diff_nodes(root)
+    if min_fraction <= 0:
+        return before, before
+
+    denominators = tuple(max(float(value), 1.0) for value in root["v"])
+
+    def significant(node: dict) -> bool:
+        return any(
+            node["v"][i] / denominators[i] >= min_fraction for i in range(3)
+        )
+
+    def rec(node: dict) -> None:
+        children = node.get("c")
+        if not children:
+            return
+        kept: list[dict] = []
+        dropped: list[dict] = []
+        for child in children:
+            (kept if significant(child) else dropped).append(child)
+        for child in kept:
+            rec(child)
+        if dropped:
+            values = tuple(sum(child["v"][i] for child in dropped) for i in range(3))
+            if any(values):
+                kept.append(
+                    {
+                        "n": f"<other diff: {len(dropped)} branches>",
+                        "k": "other",
+                        "v": values,
+                        "d": tuple(
+                            sum(child["d"][i] for child in dropped)
+                            for i in range(3)
+                        ),
+                    }
+                )
+        kept.sort(key=lambda child: -child["v"][0])
+        node["c"] = kept
+
+    rec(root)
+    return before, _count_diff_nodes(root)
 
 
 def write_diff_html(
@@ -302,32 +392,45 @@ def write_diff_html(
     label_b: str,
     scale_a: float,
     scale_b: float,
-) -> None:
+    min_fraction: float = 0.001,
+) -> tuple[int, int, int, int]:
     """Write four Diff-only views (Solo/Sum/Count/Sum+idle).
 
-    Widths use the current/after value and colors encode the per-metric delta
-    (red = grew, blue = shrank). Before/after values stay in the merged JSON for
-    labels and tooltips, but are not rendered as separate charts.
+    Widths are absolute leaf deltas rolled up through the hierarchy; colors encode
+    signed net delta (red = grew, blue = shrank). Diff and non-Diff outputs use
+    the same HTML renderer; its compact Diff data is projected to the normal
+    node schema in the browser.
     """
-    data = json.dumps(
-        _merge_metrics_json(tree_a, tree_b, scale_a, scale_b), ensure_ascii=False
-    )
-    data_idle = (
-        json.dumps(
-            _merge_metrics_json(tree_a_idle, tree_b_idle, scale_a, scale_b),
-            ensure_ascii=False,
+    main_tree = _merge_metrics_json(tree_a, tree_b, scale_a, scale_b)
+    main_before, main_after = _prune_diff_tree(main_tree, min_fraction)
+    data = json.dumps(main_tree, ensure_ascii=False, separators=(",", ":"))
+    if tree_a_idle is not None and tree_b_idle is not None:
+        idle_tree = _merge_metrics_json(
+            tree_a_idle, tree_b_idle, scale_a, scale_b
         )
-        if tree_a_idle is not None and tree_b_idle is not None
-        else "null"
-    )
+        idle_before, idle_after = _prune_diff_tree(idle_tree, min_fraction)
+        data_idle = json.dumps(
+            idle_tree, ensure_ascii=False, separators=(",", ":")
+        )
+    else:
+        idle_before = idle_after = 0
+        data_idle = "null"
     html = (
-        FLAMEGRAPH_DIFF_HTML_TEMPLATE.replace("__TITLE__", _html_esc(title))
+        FLAMEGRAPH_HTML_TEMPLATE.replace("__TITLE__", _html_esc(title))
         .replace("__DATA_IDLE__", data_idle)
         .replace("__DATA__", data)
-        .replace("__BEFORE_LABEL__", _html_esc(label_a))
-        .replace("__AFTER_LABEL__", _html_esc(label_b))
     )
+    labels = dict(DIFF_LABELS)
+    labels["NOTE"] += (
+        "<br>before = <b>" + _html_esc(label_a) + "</b> &nbsp;·&nbsp; "
+        "after = <b>" + _html_esc(label_b) + "</b>"
+        f"<br>Backend pruning threshold: {100 * min_fraction:g}% of total "
+        "change in all views; omitted siblings are preserved as &lt;other diff&gt;."
+    )
+    for key, val in labels.items():
+        html = html.replace(f"__{key}__", val)
     out_path.write_text(html)
+    return main_before, main_after, idle_before, idle_after
 
 
 # =============================================================================
@@ -802,7 +905,7 @@ def run_diff(args: argparse.Namespace) -> None:
     label_a = Path(args.diff).name
     label_b = Path(args.db).name
     title = f"Differential flame graph — {label_b} vs {label_a} (per-step, Solo/Sum/Count/Sum+idle)"
-    write_diff_html(
+    prune_stats = write_diff_html(
         tree_a0,
         tree_b0,
         tree_a_idle,
@@ -813,6 +916,13 @@ def run_diff(args: argparse.Namespace) -> None:
         label_b,
         scale_a,
         scale_b,
+        args.diff_min_percent / 100.0,
+    )
+    print(
+        "Backend Diff pruning: "
+        f"main {prune_stats[0]} -> {prune_stats[1]} nodes; "
+        f"idle {prune_stats[2]} -> {prune_stats[3]} nodes "
+        f"(threshold {args.diff_min_percent:g}%)"
     )
     print(
         f"Baseline steps/window: {steps_a}   Current steps/window: {steps_b}   "
@@ -871,8 +981,17 @@ def parse_args() -> argparse.Namespace:
         "to '<OUT>.html' (requires --flamegraph). The positional 'db' is the "
         "current/'after' profile; BASELINE_DB is the 'before'. Values are "
         "normalized per post-warmup step, and each frame is colored by the delta "
-        "(red = more GPU time now, blue = less). Two views show 'before' and "
-        "'after' widths so removed and added frames are both visible.",
+        "(red = more GPU time now, blue = less). Widths show rolled-up absolute "
+        "change magnitude, so removed and added frames are both visible.",
+    )
+    p.add_argument(
+        "--diff-min-percent",
+        type=float,
+        default=1.0,
+        metavar="PCT",
+        help="Backend-prune Diff subtrees smaller than this percentage of total "
+        "change in all views, aggregating omitted siblings as <other diff> "
+        "(default: 1.0; 0 disables pruning).",
     )
     p.add_argument(
         "--include-memcpy",
@@ -897,6 +1016,8 @@ def parse_args() -> argparse.Namespace:
         p.error("--skip-steps must be >= 0")
     if args.stack_depth < 0:
         p.error("--stack-depth must be >= 0")
+    if args.diff_min_percent < 0:
+        p.error("--diff-min-percent must be >= 0")
     return args
 
 

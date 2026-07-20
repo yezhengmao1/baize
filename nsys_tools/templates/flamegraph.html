@@ -44,9 +44,9 @@
 <div id="chart_solo" class="chart"></div>
 <h2>__VIEW1_H2__</h2>
 <div id="chart_sum" class="chart"></div>
-<h2>Count view — widths &prop; number of GPU activities (kernel launches + memcpy/memset); tooltip shows count and % of launches. Compare against Sum to spot many-tiny-kernel overhead (wide here, narrow in Sum)</h2>
+<h2>__COUNT_H2__</h2>
 <div id="chart_count" class="chart"></div>
-<h2 id="h2_idle">Sum + idle attribution — same as Sum, plus GPU-idle gaps added as magenta <span style="color:#c0c">&lt;idle&gt;</span> leaves under the NVTX scope that enclosed each gap (which phase the GPU stalled in)</h2>
+<h2 id="h2_idle">__IDLE_H2__</h2>
 <div id="chart_idle" class="chart"></div>
 <script src="https://d3js.org/d3.v7.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/d3-flame-graph@4.1.3/dist/d3-flamegraph.min.js"></script>
@@ -70,24 +70,35 @@ function fnv1a(s) {
   return h;
 }
 function formatNs(ns) {
-  if (ns >= 1e9) return (ns / 1e9).toFixed(3) + " s";
-  if (ns >= 1e6) return (ns / 1e6).toFixed(3) + " ms";
-  if (ns >= 1e3) return (ns / 1e3).toFixed(3) + " us";
-  return Math.round(ns) + " ns";
+  var sign = ns < 0 ? "-" : "";
+  ns = Math.abs(ns);
+  if (ns >= 1e9) return sign + (ns / 1e9).toFixed(3) + " s";
+  if (ns >= 1e6) return sign + (ns / 1e6).toFixed(3) + " ms";
+  if (ns >= 1e3) return sign + (ns / 1e3).toFixed(3) + " us";
+  return sign + Math.round(ns) + " ns";
 }
 function fmtInt(n) { return Math.round(n).toLocaleString(); }
 function projectView(node, viewKey) {
-  // Copy the tree, picking `value` from the requested field.
+  // Normal trees use named fields. Diff trees use compact v/d arrays in
+  // (sum, solo, count) order, then project to this exact same renderer shape.
+  var compact = Array.isArray(node.v) && Array.isArray(node.d);
+  var index = {sum: 0, solo: 1, count: 2}[viewKey];
   var out = {
-    name:    node.name,
-    kind:    node.kind,
-    value:   node[viewKey] || 0,
-    sum:     node.sum,
-    solo:    node.solo,
-    count:   node.count || 0
+    name:    compact ? node.n : node.name,
+    kind:    compact ? node.k : node.kind,
+    value:   compact ? (node.v[index] || 0) : (node[viewKey] || 0),
+    sum:     compact ? node.v[0] : node.sum,
+    solo:    compact ? node.v[1] : node.solo,
+    count:   compact ? (node.v[2] || 0) : (node.count || 0)
   };
-  if (node.children) {
-    out.children = node.children.map(function(c) { return projectView(c, viewKey); });
+  if (compact) {
+    out.delta_sum = node.d[0];
+    out.delta_solo = node.d[1];
+    out.delta_count = node.d[2];
+  }
+  var children = compact ? node.c : node.children;
+  if (children) {
+    out.children = children.map(function(c) { return projectView(c, viewKey); });
   }
   return out;
 }
@@ -112,6 +123,16 @@ function colorFor(d, mode) {
   // mapper fully replaces the library default, so we must honor that flag
   // ourselves — otherwise search runs but visual feedback is invisible.
   if (d.highlight) return "#e600e6";
+  if (Object.prototype.hasOwnProperty.call(d.data, "delta_sum")) {
+    var delta = d.data["delta_" + mode] || 0;
+    var maxDelta = d.data._maxDelta || 1;
+    var frac = Math.min(1, Math.abs(delta) / maxDelta);
+    var diffLig = (96 - 46 * frac).toFixed(1);
+    var diffSat = (20 + 65 * frac).toFixed(1);
+    if (delta > 0) return "hsl(2," + diffSat + "%," + diffLig + "%)";
+    if (delta < 0) return "hsl(212," + diffSat + "%," + diffLig + "%)";
+    return "hsl(0,0%,92%)";
+  }
   var bc = baseColor(d.data.kind || "nvtx", d.data.name || "");
   // Idle has no overlap semantics (it's the absence of work) — keep it at
   // its fixed dark-gray in every view so the color stays unambiguous.
@@ -129,6 +150,22 @@ function colorFor(d, mode) {
   var sat = bc.sat * (1 - r) + 12 * r;
   var lig = bc.lig * (1 - r) + 86 * r;
   return "hsl(" + bc.hue + "," + sat.toFixed(1) + "%," + lig.toFixed(1) + "%)";
+}
+
+function maxDeltaOf(root, viewKey) {
+  var mx = 0, field = "delta_" + viewKey;
+  (function scan(n, isRoot) {
+    if (!isRoot) mx = Math.max(mx, Math.abs(n[field] || 0));
+    if (n.children) n.children.forEach(function(c) { scan(c, false); });
+  })(root, true);
+  return mx || 1;
+}
+
+function attachMaxDelta(root, viewKey, maxDelta) {
+  (function scan(n) {
+    n._maxDelta = maxDelta;
+    if (n.children) n.children.forEach(scan);
+  })(root);
 }
 
 // Case-insensitive search: default lib match is case-sensitive, which is
@@ -165,6 +202,8 @@ function renderSearchStats() {
 
 function makeChart(containerSel, viewKey, srcTree, reportStats) {
   var data = projectView(srcTree || treeData, viewKey);
+  var isDiff = Object.prototype.hasOwnProperty.call(data, "delta_sum");
+  if (isDiff) attachMaxDelta(data, viewKey, maxDeltaOf(data, viewKey));
   var total = data.value || 1;
   var isCount = viewKey === "count";
   var countTotal = data.count || 1;
@@ -188,6 +227,15 @@ function makeChart(containerSel, viewKey, srcTree, reportStats) {
     .label(function(d) {
       var summ = d.data.sum, solo = d.data.solo, cnt = d.data.count || 0;
       var pct  = (100 * d.value / total).toFixed(2);
+      if (isDiff) {
+        var delta = d.data["delta_" + viewKey] || 0;
+        var diffValue = isCount ? fmtInt(d.value) : formatNs(d.value);
+        var deltaValue = isCount ? fmtInt(delta) : formatNs(delta);
+        return d.data.name +
+          "\n  " + (VIEWLABEL[viewKey] || viewKey) + " width: " + diffValue +
+          " (" + pct + "% of total change)" +
+          "\n  net delta: " + (delta >= 0 ? "+" : "") + deltaValue;
+      }
       var over = summ > 0 ? (100 * (summ - solo) / summ).toFixed(1) : "0.0";
       var primary = isCount
         ? fmtInt(d.value) + " (" + pct + "% of launches)"
