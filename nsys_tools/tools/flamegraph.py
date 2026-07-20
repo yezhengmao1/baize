@@ -232,8 +232,9 @@ def write_html(
 
 # =============================================================================
 # Differential flame graph (compare two stack trees: baseline vs current) —
-# the whole 4-view flame graph (Solo/Sum/Count/Sum+idle) tripled: Before / After
-# / Diff. See write_diff_html + templates/flamegraph_diff.html.
+# four Diff-only views (Solo/Sum/Count/Sum+idle). The merged tree still carries
+# both sides for delta tooltips, but only one set of charts is rendered.
+
 # =============================================================================
 
 _DIFF_TEMPLATE_PATH = (
@@ -302,11 +303,12 @@ def write_diff_html(
     scale_a: float,
     scale_b: float,
 ) -> None:
-    """The whole 4-view flame graph (Solo/Sum/Count/Sum+idle) tripled: BEFORE
-    (baseline) / AFTER (current) / DIFF. Before/After are ordinary flame graphs;
-    the Diff row colors each frame by the per-metric delta (red = grew, blue =
-    shrank). `tree_a/b` (pure GPU activity) drive Solo/Sum/Count; the idle trees
-    drive Sum+idle (or that view is dropped when either window had no idle)."""
+    """Write four Diff-only views (Solo/Sum/Count/Sum+idle).
+
+    Widths use the current/after value and colors encode the per-metric delta
+    (red = grew, blue = shrank). Before/after values stay in the merged JSON for
+    labels and tooltips, but are not rendered as separate charts.
+    """
     data = json.dumps(
         _merge_metrics_json(tree_a, tree_b, scale_a, scale_b), ensure_ascii=False
     )
@@ -818,8 +820,8 @@ def run_diff(args: argparse.Namespace) -> None:
     )
     print(
         f"Wrote diff flame graph: {html}   "
-        "(the 4-view flame graph ×3: Before / After [normal colors] / Diff "
-        "[red = grew, blue = shrank], each with Solo / Sum / Count / Sum+idle)"
+        "(Diff only: red = grew, blue = shrank; "
+        "Solo / Sum / Count / Sum+idle)"
     )
     print()
 

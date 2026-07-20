@@ -1,11 +1,8 @@
 <!DOCTYPE html>
 <!--
   Template rendered by nsys_tools/tools/flamegraph.py :: write_diff_html.
-  The whole 4-view flame graph (Solo / Sum / Count / Sum+idle), TRIPLED top to
-  bottom: BEFORE (baseline) / AFTER (current) / DIFF (after - before).
-  Before & After are ordinary flame graphs (normal color-by-kind, Sum-view
-  overlap saturation); the Diff row uses After widths but colors each frame by
-  the per-metric delta. 12 charts share one hierarchy + one search/zoom.
+  Diff-only flame graph: Solo / Sum / Count / Sum+idle. Widths use After and
+  colors encode After - Before. Four charts share one hierarchy + search/zoom.
   Substitutions (plain string replace):
     __TITLE__  __BEFORE_LABEL__  __AFTER_LABEL__
     __DATA__       merged non-idle tree: node.a/.b = {sum,solo,count} per-step
@@ -20,8 +17,6 @@
   body { font-family: sans-serif; margin: 0; padding: 12px 18px; background: #fafafa; color: #222; }
   h1 { margin: 2px 0 4px; font-size: 15px; }
   h2.section { margin: 22px 0 2px; font-size: 15px; padding: 3px 8px; border-radius: 3px; color: #fff; }
-  h2.before { background: #4a72b0; }
-  h2.after  { background: #4a9b6e; }
   h2.diff   { background: #a23b4d; }
   h3 { margin: 12px 0 4px; font-size: 12.5px; color: #333; border-bottom: 1px solid #ddd; padding-bottom: 2px; }
   .legend, .note { margin: 4px 0; font-size: 12px; color: #555; }
@@ -37,13 +32,6 @@
 <body>
 <h1>__TITLE__</h1>
 <div class="legend">
-  <b>Before / After</b> (color by kind):
-  <span class="sw" style="background:hsl(210,45%,62%)"></span> NVTX
-  <span class="sw" style="background:hsl(25,80%,58%)"></span> GPU kernel
-  <span class="sw" style="background:hsl(140,58%,46%)"></span> memcpy
-  <span class="sw" style="background:hsl(275,52%,56%)"></span> memset
-  <span class="sw" style="background:hsl(320,85%,55%)"></span> idle
-  &nbsp; (Sum views fade pale ∝ overlap) &nbsp;|&nbsp;
   <b>Diff</b>: <span class="sw" style="background:hsl(2,75%,55%)"></span> grew
   <span class="sw" style="background:hsl(0,0%,92%)"></span> ~same
   <span class="sw" style="background:hsl(212,75%,55%)"></span> shrank
@@ -51,12 +39,10 @@
   before = <b>__BEFORE_LABEL__</b> &nbsp;·&nbsp; after = <b>__AFTER_LABEL__</b>
 </div>
 <div class="note">
-  The full 4-view flame graph (Solo / Sum / Count / Sum+idle) is shown three times:
-  <b>Before</b> (baseline) and <b>After</b> (current) are ordinary flame graphs;
-  the <b>Diff</b> row has the After widths but colors each frame by the delta
-  <b>after − before</b> of that view's metric (saturation ∝ |delta| / max|delta|
-  within the view). Widths are per-step averages, so different step counts compare
-  fairly. Search / zoom act on all charts at once.
+  Four Diff-only views are shown (Solo / Sum / Count / Sum+idle). Widths use
+  <b>After</b>; colors encode <b>after − before</b>. Widths are per-step averages,
+  so different step counts compare fairly. Before/After values remain available
+  in every tooltip. Search / zoom act on all charts at once.
 </div>
 <div id="controls">
   <input type="text" id="term" placeholder="Search frame name (case-insensitive regex)…"/>
@@ -193,7 +179,7 @@ function makeChart(containerSel, treeData, side, metric, colorMapper, reportStat
   return c;
 }
 
-// build the page: 3 sections x 4 views -------------------------------------
+// build the page: one Diff section x four views -----------------------------
 var VIEWS = [
   { key: "solo",  tree: "main", metric: "solo",  mode: "plain",   h3: "Solo — Σ per-activity solo time (the part that blocks the GPU clock)" },
   { key: "sum",   tree: "main", metric: "sum",   mode: "overlap", h3: "Sum — Σ GPU-activity time (saturation = overlap; pale = hidden)" },
@@ -201,8 +187,6 @@ var VIEWS = [
   { key: "idle",  tree: "idle", metric: "sum",   mode: "overlap", h3: "Sum + idle — Sum plus GPU-idle gaps (magenta), by enclosing scope" }
 ];
 var SECTIONS = [
-  { key: "before", cls: "before", side: "a", diff: false, title: "BEFORE — baseline (__BEFORE_LABEL__)" },
-  { key: "after",  cls: "after",  side: "b", diff: false, title: "AFTER — current (__AFTER_LABEL__)" },
   { key: "diff",   cls: "diff",   side: "b", diff: true,  title: "DIFF — after − before (red = grew, blue = shrank)" }
 ];
 
@@ -225,7 +209,7 @@ SECTIONS.forEach(function(sec) {
     } else {
       mapper = colorPlain;
     }
-    var report = (sec.key === "after" && v.key === "sum");
+    var report = (sec.key === "diff" && v.key === "sum");
     makeChart("#" + div.id, TREES[v.tree], sec.side, v.metric, mapper, report);
   });
 });
