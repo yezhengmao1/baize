@@ -402,8 +402,10 @@ def write_shape_html(
         .replace("__ROWS__", json.dumps(rows_json, ensure_ascii=False))
     )
     path = Path(out)
-    path = path.with_suffix(".html") if path.suffix.lower() == ".html" else Path(
-        str(path) + ".html"
+    path = (
+        path.with_suffix(".html")
+        if path.suffix.lower() == ".html"
+        else Path(str(path) + ".html")
     )
     path.write_text(html)
     print(f"Wrote shape visualization: {path}   (open in browser)")
@@ -503,7 +505,13 @@ if __name__ == "__main__":
         write_csv(table, stats, args.csv)
     if args.html:
         write_shape_html(
-            args.db, rank, table, stats, kern_names, len(steps), args.skip_steps,
+            args.db,
+            rank,
+            table,
+            stats,
+            kern_names,
+            len(steps),
+            args.skip_steps,
             args.html,
         )
 
