@@ -181,12 +181,28 @@ def _deepep_frame(stack):
     return frame
 
 
+def _deepep_op(frame, kernel_name: str) -> str:
+    """Communication direction for a kernel in a logical DeepEP call.
+
+    Helper kernels do not reliably carry ``dispatch``/``combine`` in their own
+    names, so the enclosing fused range is authoritative. Backward applies the
+    inverse communication: CombineBackward dispatches gradients to experts,
+    while DispatchBackward combines gradients back to the token owners.
+    """
+    if frame is not None:
+        is_dispatch = frame.name.startswith("FusedDispatch")
+        is_backward = frame.name.startswith(
+            ("FusedDispatchBackward", "FusedCombineBackward")
+        )
+        return "Dispatch" if is_dispatch != is_backward else "Combine"
+    return "Combine" if "combine" in kernel_name else "Dispatch"
+
+
 def _deepep_volume(stack, dtype_bytes: int = 2) -> int:
     """Token-payload bytes for a DeepEP kernel: first tensor of its enclosing
     FusedDispatch/FusedCombine range × dtype_bytes. 0 if no such range is found."""
     frame = _deepep_frame(stack)
     return _first_tensor_elems(frame.name) * dtype_bytes if frame else 0
-
 
 
 def parse_range(text: str):
@@ -380,14 +396,14 @@ def _load_deepeps(
     stacks = idx.iter_stacks((k["api_start"], k["api_end"]) for k in kernels)
     for k, (_, _, stack) in zip(kernels, stacks):
         name = k["kernel_name"]
-        op = "Combine" if "combine" in name else "Dispatch"
+        frame = _deepep_frame(stack)
+        op = _deepep_op(frame, name)
         mode = "internode" if "internode" in k["full_name"] else "intranode"
         # only the data-moving dispatch/combine kernels carry payload; the
         # notify/layout helpers move no tokens (but their wait time is real).
         nbytes = (
             _deepep_volume(stack, dtype_bytes) if name in ("dispatch", "combine") else 0
         )
-        frame = _deepep_frame(stack)
         out.append(
             CommEvent(
                 op=op,

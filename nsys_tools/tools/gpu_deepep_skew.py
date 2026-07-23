@@ -31,6 +31,7 @@ Author: yezhengmaolove@gmail.com
 """
 
 import argparse
+import bisect
 import os
 import sys
 from collections import defaultdict
@@ -47,11 +48,14 @@ from ..utils.nvtx import NvtxIndex
 
 LOCAL_WORLD = 8
 CDF_DISPLAY_PERCENTILE = 99.5
+CORRELATION_DISPLAY_PERCENTILE = 90.0
+COMM_KERNEL_PREFIXES = ("ncclDevKernel", "ncclKernel")
 PHASES = ("Dispatch", "Combine")
 COMPUTE_PHASES = ("Forward", "Dgrad", "Wgrad")
 MLP_PHASES = COMPUTE_PHASES
 MLP_NVTX_TO_PHASE = {
     "mlp forward": "Forward",
+    "_FusedMoEProjection": "Forward",
     "mlp backward": "Dgrad",
     "mlp wgrad": "Wgrad",
 }
@@ -93,15 +97,21 @@ FROM NVTX_EVENTS n
 LEFT JOIN StringIds s ON s.id = n.textId
 WHERE n.end IS NOT NULL
   AND (COALESCE(n.text, s.value) IN ("mlp forward", "attn forward")
+       OR COALESCE(n.text, s.value) = "_FusedMoEProjection"
+       OR COALESCE(n.text, s.value) LIKE "_FusedMoEProjection,%"
        OR COALESCE(n.text, s.value) LIKE "FusedDispatch%"
        OR COALESCE(n.text, s.value) LIKE "FusedCombine%")
 ORDER BY n.globalTid, n.start, n.end
 """
 
 
+def _nvtx_base(name: str) -> str:
+    return name.split(",", 1)[0]
+
+
 def load_forward_handoffs(
     conn, ws: int, we: int
-) -> dict[tuple[str, int, int], tuple[int, int]]:
+) -> dict[tuple[int, int], tuple[int, int]]:
     """Map Forward NVTX ranges to their directly adjacent DeepEP range.
 
     Only semantic adjacency on the same CPU thread is accepted. Dense paths
@@ -113,20 +123,21 @@ def load_forward_handoffs(
 
     expected = {
         "mlp forward": "FusedCombine",
+        "_FusedMoEProjection": "FusedCombine",
         "attn forward": "FusedDispatch",
     }
     result = {}
     for rows in relevant_by_tid.values():
         for index, row in enumerate(rows[:-1]):
-            target_prefix = expected.get(row["name"])
+            target_prefix = expected.get(_nvtx_base(row["name"]))
             if target_prefix is None or not (ws < row["start"] <= we):
                 continue
             target = rows[index + 1]
             if (
                 target["start"] >= row["end"]
-                and target["name"].startswith(target_prefix)
+                and _nvtx_base(target["name"]) == target_prefix
             ):
-                result[(row["name"], row["start"], row["end"])] = (
+                result[(row["start"], row["end"])] = (
                     target["start"],
                     target["end"],
                 )
@@ -144,6 +155,9 @@ class MlpInstance:
     kernels: int
     step: int
     next_comm_call_id: tuple[int, int] | None = None
+    predispatch_kernel_ns: int | None = None
+    predispatch_comm_ns: int | None = None
+    predispatch_idle_ns: int | None = None
 
     @property
     def span(self) -> int | None:
@@ -221,7 +235,7 @@ def load_compute_instances(
     scratch: dict[tuple[str, int, int], list[int | None]] = {}
     instance_steps: dict[tuple[str, int, int], int] = {}
     for start, end, name in zip(idx.starts, idx.ends, idx.names):
-        phase = nvtx_to_phase.get(name)
+        phase = nvtx_to_phase.get(_nvtx_base(name))
         start, end = int(start), int(end)
         if phase is None or not (ws < start <= we):
             continue
@@ -243,7 +257,7 @@ def load_compute_instances(
     for row, (_, _, stack) in zip(rows, stacks):
         target = None
         for frame in reversed(stack):
-            phase = nvtx_to_phase.get(frame.name)
+            phase = nvtx_to_phase.get(_nvtx_base(frame.name))
             if phase is not None:
                 target = (phase, frame.start, frame.end)
                 break
@@ -279,22 +293,18 @@ def load_mlp_instances(
     conn, idx: NvtxIndex, ws: int, we: int, step_windows: list[tuple[int, int, int]]
 ) -> dict[str, list[MlpInstance]]:
     """Collect exact Expert-MLP NVTX occurrences and their GPU spans."""
-    return load_compute_instances(
-        conn, idx, ws, we, step_windows, MLP_NVTX_TO_PHASE
-    )
+    return load_compute_instances(conn, idx, ws, we, step_windows, MLP_NVTX_TO_PHASE)
 
 
 def load_attn_instances(
     conn, idx: NvtxIndex, ws: int, we: int, step_windows: list[tuple[int, int, int]]
 ) -> dict[str, list[MlpInstance]]:
     """Collect exact attention NVTX occurrences and their GPU spans."""
-    return load_compute_instances(
-        conn, idx, ws, we, step_windows, ATTN_NVTX_TO_PHASE
-    )
+    return load_compute_instances(conn, idx, ws, we, step_windows, ATTN_NVTX_TO_PHASE)
 
 
 def load_rank(
-    db: str, needle: str, skip: int, dtype_bytes: int
+    db: str, needle: str, skip: int, dtype_bytes: int, only_step: int | None = None
 ) -> tuple:
     """Load DeepEP dispatch/combine events and compute-family spans for one rank.
     Returns (rank, events, mlp, attn, utc_epoch_ns, window_duration_ns, n_steps)."""
@@ -305,20 +315,99 @@ def load_rank(
     utc_offset = epoch or 0
     idx = NvtxIndex(conn, rank)
     ws, we, nsteps, step_windows = _window(conn, idx, needle, skip)
+    if only_step is not None:
+        step_windows = [window for window in step_windows if window[2] == only_step]
+        if len(step_windows) != 1:
+            raise ValueError(f"step {only_step} not found exactly once in {db}")
+        ws, we, _ = step_windows[0]
     events = load_deepep_in_window(conn, idx, ws, we, dtype_bytes)
     mlp = load_mlp_instances(conn, idx, ws, we, step_windows)
     attn = load_attn_instances(conn, idx, ws, we, step_windows)
     handoffs = load_forward_handoffs(conn, ws, we)
+    dispatch_first_kernel = {}
+    for event in events:
+        if event.op != "Dispatch" or event.call_id is None:
+            continue
+        current = dispatch_first_kernel.get(event.call_id)
+        if current is None or event.gpu_start < current:
+            dispatch_first_kernel[event.call_id] = event.gpu_start
+
+    # Split compute and communication kernel durations in the handoff window. The lower
+    # boundary is the last kernel owned by the outer attn-forward NVTX range;
+    # the upper boundary is the first kernel owned by its adjacent Dispatch.
+    # Kernel-free launch/CPU gaps are deliberately excluded.
+    kernel_intervals = conn.execute(
+        """
+        SELECT k.start, k.end, s.value AS kernel_name
+        FROM CUPTI_ACTIVITY_KIND_KERNEL k
+        JOIN StringIds s ON s.id = k.shortName
+        WHERE k.start >= ? AND k.start <= ?
+        ORDER BY k.start
+        """,
+        (ws, we),
+    ).fetchall()
+    kernel_starts = [row["start"] for row in kernel_intervals]
+
+    def prepare_attn_instance(instance: MlpInstance, phase: str) -> MlpInstance:
+        call_id = (
+            handoffs.get((instance.nvtx_start, instance.nvtx_end))
+            if phase == "Forward"
+            else None
+        )
+        kernel_time = None
+        comm_time = None
+        idle_time = None
+        dispatch_start = dispatch_first_kernel.get(call_id)
+        if instance.gpu_end is not None and dispatch_start is not None:
+            if dispatch_start >= instance.gpu_end:
+                begin = bisect.bisect_left(kernel_starts, instance.gpu_end)
+                finish = bisect.bisect_left(kernel_starts, dispatch_start)
+                handoff_kernels = [
+                    row
+                    for row in kernel_intervals[begin:finish]
+                    if row["end"] <= dispatch_start
+                ]
+                if handoff_kernels:
+                    comm_time = sum(
+                        row["end"] - row["start"]
+                        for row in handoff_kernels
+                        if row["kernel_name"].startswith(COMM_KERNEL_PREFIXES)
+                    )
+                    kernel_time = sum(
+                        row["end"] - row["start"]
+                        for row in handoff_kernels
+                        if not row["kernel_name"].startswith(COMM_KERNEL_PREFIXES)
+                    )
+                    kernel_span = max(row["end"] for row in handoff_kernels) - min(
+                        row["start"] for row in handoff_kernels
+                    )
+                    idle_time = kernel_span - kernel_time - comm_time
+        return replace(
+            instance,
+            gpu_start=(
+                None if instance.gpu_start is None else instance.gpu_start + utc_offset
+            ),
+            gpu_end=None if instance.gpu_end is None else instance.gpu_end + utc_offset,
+            next_comm_call_id=call_id,
+            predispatch_kernel_ns=kernel_time,
+            predispatch_comm_ns=comm_time,
+            predispatch_idle_ns=idle_time,
+        )
+
     mlp = {
         phase: [
             replace(
                 instance,
                 gpu_start=(
-                    None if instance.gpu_start is None else instance.gpu_start + utc_offset
+                    None
+                    if instance.gpu_start is None
+                    else instance.gpu_start + utc_offset
                 ),
-                gpu_end=None if instance.gpu_end is None else instance.gpu_end + utc_offset,
+                gpu_end=(
+                    None if instance.gpu_end is None else instance.gpu_end + utc_offset
+                ),
                 next_comm_call_id=(
-                    handoffs.get(("mlp forward", instance.nvtx_start, instance.nvtx_end))
+                    handoffs.get((instance.nvtx_start, instance.nvtx_end))
                     if phase == "Forward"
                     else None
                 ),
@@ -328,21 +417,7 @@ def load_rank(
         for phase, instances in mlp.items()
     }
     attn = {
-        phase: [
-            replace(
-                instance,
-                gpu_start=(
-                    None if instance.gpu_start is None else instance.gpu_start + utc_offset
-                ),
-                gpu_end=None if instance.gpu_end is None else instance.gpu_end + utc_offset,
-                next_comm_call_id=(
-                    handoffs.get(("attn forward", instance.nvtx_start, instance.nvtx_end))
-                    if phase == "Forward"
-                    else None
-                ),
-            )
-            for instance in instances
-        ]
+        phase: [prepare_attn_instance(instance, phase) for instance in instances]
         for phase, instances in attn.items()
     }
     conn.close()
@@ -350,7 +425,6 @@ def load_rank(
         event._replace(gpu_start=event.gpu_start + utc_offset) for event in events
     ]
     return rank, events, mlp, attn, epoch, we - ws, nsteps
-
 
 
 def load_all(
@@ -427,8 +501,6 @@ def accumulate(records: list[tuple[int, list[CommEvent]]]) -> dict[int, dict]:
     return per_rank
 
 
-
-
 @dataclass
 class LogicalCall:
     """One rank's kernels folded into one enclosing FusedDispatch/Combine call."""
@@ -474,7 +546,6 @@ def _match_phase_by_time(
     ranks: list[int],
     phase: str,
 ) -> tuple[list[list[LogicalCall]], int]:
-
     """Match calls by chronological position within the analysis window.
     This deliberately does not use an NVTX sequence field. Each rank's calls
     are ordered by GPU start time inside the same post-warmup analysis window;
@@ -533,8 +604,6 @@ def build_histogram_samples(
     return samples, warnings
 
 
-
-
 @dataclass(frozen=True)
 class ComputeCommSample:
     """Compute-duration and UTC-aligned communication-start skew for one pair."""
@@ -543,6 +612,19 @@ class ComputeCommSample:
     target_start_skew_ns: int
 
 
+@dataclass(frozen=True)
+class PredispatchKernelSample:
+    """Per-call EP-rank statistics for compute, communication, and idle time."""
+
+    floor_ns: int
+    maximum_ns: int
+    skew_ns: int
+    comm_floor_ns: int
+    comm_maximum_ns: int
+    comm_skew_ns: int
+    idle_floor_ns: int
+    idle_maximum_ns: int
+    idle_skew_ns: int
 
 
 def _build_compute_comm_samples(
@@ -553,6 +635,7 @@ def _build_compute_comm_samples(
     compute_phase: str,
     target_phase: str,
     source_label: str,
+    include_predispatch_kernel_time: bool = False,
 ) -> tuple[list[ComputeCommSample], list[str]]:
     """Pair compute with its directly adjacent NVTX communication range.
 
@@ -567,7 +650,10 @@ def _build_compute_comm_samples(
     }
     samples = []
     warnings = []
-    relation = f"{source_label} {compute_phase} -> {target_phase}"
+    relation_source = f"{source_label} {compute_phase}"
+    if include_predispatch_kernel_time:
+        relation_source += " + Router/Preprocess compute+comm Σkernel"
+    relation = f"{relation_source} -> {target_phase}"
 
     def count_text(counts):
         values = set(counts.values())
@@ -602,6 +688,12 @@ def _build_compute_comm_samples(
                 if call_id is None:
                     ignored += 1
                     continue
+                if include_predispatch_kernel_time and (
+                    instance.predispatch_kernel_ns is None
+                    or instance.predispatch_comm_ns is None
+                ):
+                    empty_compute += 1
+                    continue
                 call = calls_by_id[rank].get(call_id)
                 if call is None or call.phase != target_phase:
                     missing_kernel += 1
@@ -619,15 +711,11 @@ def _build_compute_comm_samples(
             duplicate_target_counts[rank] = duplicate_target
             empty_compute_counts[rank] = empty_compute
 
-        steps = sorted(
-            {step for grouped in per_rank_step.values() for step in grouped}
-        )
+        steps = sorted({step for grouped in per_rank_step.values() for step in grouped})
         mismatch_steps = 0
         group_samples = 0
         for step in steps:
-            counts = {
-                rank: len(per_rank_step[rank].get(step, [])) for rank in ranks
-            }
+            counts = {rank: len(per_rank_step[rank].get(step, [])) for rank in ranks}
             if len(set(counts.values())) != 1:
                 mismatch_steps += 1
                 warnings.append(
@@ -641,7 +729,14 @@ def _build_compute_comm_samples(
                     rank: per_rank_step[rank][step][occurrence] for rank in ranks
                 }
                 source_duration = [
-                    matched[rank][1].gpu_end - matched[rank][1].gpu_start
+                    matched[rank][1].gpu_end
+                    - matched[rank][1].gpu_start
+                    + (
+                        matched[rank][1].predispatch_kernel_ns
+                        + matched[rank][1].predispatch_comm_ns
+                        if include_predispatch_kernel_time
+                        else 0
+                    )
                     for rank in ranks
                 ]
                 target_start = [matched[rank][2].start_ns for rank in ranks]
@@ -650,9 +745,7 @@ def _build_compute_comm_samples(
                         source_duration_skew_ns=(
                             max(source_duration) - min(source_duration)
                         ),
-                        target_start_skew_ns=(
-                            max(target_start) - min(target_start)
-                        ),
+                        target_start_skew_ns=(max(target_start) - min(target_start)),
                     )
                 )
                 group_samples += 1
@@ -695,10 +788,131 @@ def build_attn_dispatch_samples(
     attn_per_rank: dict[int, dict[str, list[MlpInstance]]],
     epochs: dict[int, int | None],
     ep: int,
+    include_router_compute: bool = True,
 ) -> tuple[list[ComputeCommSample], list[str]]:
     return _build_compute_comm_samples(
-        records, attn_per_rank, epochs, ep, "Forward", "Dispatch", ATTN_LABEL
+        records,
+        attn_per_rank,
+        epochs,
+        ep,
+        "Forward",
+        "Dispatch",
+        ATTN_LABEL,
+        include_router_compute,
     )
+
+
+def build_predispatch_kernel_samples(
+    records: list[tuple[int, list[CommEvent]]],
+    attn_per_rank: dict[int, dict[str, list[MlpInstance]]],
+    ep: int,
+) -> tuple[list[PredispatchKernelSample], list[str]]:
+    """Align attn-to-Dispatch handoffs and skew their summed kernel durations."""
+    calls = _logical_calls_by_rank(records)
+    calls_by_id = {
+        rank: {call.call_id: call for call in rank_calls}
+        for rank, rank_calls in calls.items()
+    }
+    samples = []
+    warnings = []
+
+    for gid, ranks in sorted(group_ranks(attn_per_rank, ep).items()):
+        if len(ranks) != ep or any(rank not in calls_by_id for rank in ranks):
+            warnings.append(
+                f"g{gid}: skipped incomplete Router/Preprocess EP group "
+                f"({len(ranks)}/{ep} ranks)"
+            )
+            continue
+
+        per_rank_step = {}
+        ignored_counts = {}
+        missing_counts = {}
+        for rank in ranks:
+            grouped = defaultdict(list)
+            ignored = missing = 0
+            for instance in attn_per_rank[rank]["Forward"]:
+                call_id = instance.next_comm_call_id
+                if call_id is None:
+                    ignored += 1
+                    continue
+                call = calls_by_id[rank].get(call_id)
+                if (
+                    call is None
+                    or call.phase != "Dispatch"
+                    or instance.predispatch_kernel_ns is None
+                    or instance.predispatch_comm_ns is None
+                    or instance.predispatch_idle_ns is None
+                ):
+                    missing += 1
+                    continue
+                grouped[instance.step].append(
+                    (
+                        call.start_ns,
+                        instance.predispatch_kernel_ns,
+                        instance.predispatch_comm_ns,
+                        instance.predispatch_idle_ns,
+                    )
+                )
+            for items in grouped.values():
+                items.sort(key=lambda item: item[0])
+            per_rank_step[rank] = grouped
+            ignored_counts[rank] = ignored
+            missing_counts[rank] = missing
+
+        steps = sorted({step for grouped in per_rank_step.values() for step in grouped})
+        mismatch_steps = 0
+        group_samples = 0
+        for step in steps:
+            counts = {rank: len(per_rank_step[rank].get(step, [])) for rank in ranks}
+            if len(set(counts.values())) != 1:
+                mismatch_steps += 1
+                warnings.append(
+                    f"g{gid} Router/Preprocess S{step}: unequal counts {counts}; "
+                    "step skipped"
+                )
+                continue
+            count = next(iter(counts.values()), 0)
+            for occurrence in range(count):
+                durations = [per_rank_step[rank][step][occurrence][1] for rank in ranks]
+                comm_durations = [
+                    per_rank_step[rank][step][occurrence][2] for rank in ranks
+                ]
+                idle_durations = [
+                    per_rank_step[rank][step][occurrence][3] for rank in ranks
+                ]
+                floor = min(durations)
+                maximum = max(durations)
+                comm_floor = min(comm_durations)
+                comm_maximum = max(comm_durations)
+                idle_floor = min(idle_durations)
+                idle_maximum = max(idle_durations)
+                samples.append(
+                    PredispatchKernelSample(
+                        floor_ns=floor,
+                        maximum_ns=maximum,
+                        skew_ns=maximum - floor,
+                        comm_floor_ns=comm_floor,
+                        comm_maximum_ns=comm_maximum,
+                        comm_skew_ns=comm_maximum - comm_floor,
+                        idle_floor_ns=idle_floor,
+                        idle_maximum_ns=idle_maximum,
+                        idle_skew_ns=idle_maximum - idle_floor,
+                    )
+                )
+                group_samples += 1
+
+        def count_text(counts):
+            values = set(counts.values())
+            return str(next(iter(values))) if len(values) == 1 else str(counts)
+
+        print(
+            f"  Router/Preprocess kernel time g{gid}: paired={group_samples}, "
+            f"dense/non-adjacent={count_text(ignored_counts)}, "
+            f"missing-boundary={count_text(missing_counts)}, "
+            f"count-mismatch-steps={mismatch_steps}",
+            file=sys.stderr,
+        )
+    return samples, warnings
 
 
 def render_histograms(
@@ -724,10 +938,20 @@ def render_histograms(
     attn_dispatch_samples, attn_correlation_warnings = build_attn_dispatch_samples(
         records, attn_per_rank, epochs, ep
     )
+    predispatch_samples, predispatch_warnings = build_predispatch_kernel_samples(
+        records, attn_per_rank, ep
+    )
+    (
+        attn_only_dispatch_samples,
+        attn_only_correlation_warnings,
+    ) = build_attn_dispatch_samples(records, attn_per_rank, epochs, ep, False)
+
     warnings.extend(mlp_warnings)
     warnings.extend(attn_warnings)
     warnings.extend(correlation_warnings)
     warnings.extend(attn_correlation_warnings)
+    warnings.extend(attn_only_correlation_warnings)
+    warnings.extend(predispatch_warnings)
     compute_rows = []
     has_mlp = any(mlp_samples[phase] for phase in MLP_PHASES)
     has_attn = any(attn_samples[phase] for phase in COMPUTE_PHASES)
@@ -744,8 +968,15 @@ def render_histograms(
     from matplotlib.ticker import MultipleLocator
 
     cell_ms = 0.25
+    # Keep rare outliers in every numeric statistic, but exclude them from the
+    # display range so a handful of long calls do not flatten the main body of
+    # the histogram. The cumulative panels already use the same P99.5 cap.
     time_max_ms = max(
-        max(samples[phase]["total_ns"], default=0) / 1e6 for phase in PHASES
+        np.percentile(
+            np.asarray(samples[phase]["total_ns"]) / 1e6,
+            CDF_DISPLAY_PERCENTILE,
+        )
+        for phase in PHASES
     )
     time_hi = max(cell_ms, np.ceil(time_max_ms / cell_ms) * cell_ms)
     label_step_ms = max(1.0, float(np.ceil(time_hi / 8)))
@@ -768,7 +999,7 @@ def render_histograms(
         "font.serif": ["DejaVu Serif", "Times New Roman", "Times"],
         "font.size": 9,
         "axes.labelsize": 9,
-        "axes.titlesize": 10,
+        "axes.titlesize": 9,
         "legend.fontsize": 8,
         "xtick.labelsize": 8,
         "ytick.labelsize": 8,
@@ -779,17 +1010,17 @@ def render_histograms(
     letters = "abcdefghijklmnopqrstuvwxyz"
 
     with plt.rc_context(style):
-        fig = plt.figure(figsize=(16.2, 7.2))
+        fig = plt.figure(figsize=(14.2, 14.0))
         outer = fig.add_gridspec(
-            2,
-            4,
-            height_ratios=(1.08, 0.92),
+            3,
+            3,
+            height_ratios=(1.0, 1.0, 0.92),
             left=0.055,
             right=0.985,
-            bottom=0.085,
-            top=0.96,
-            wspace=0.42,
-            hspace=0.40,
+            bottom=0.055,
+            top=0.975,
+            wspace=0.32,
+            hspace=0.42,
         )
         dist_axes = [
             fig.add_subplot(outer[0, 0]),
@@ -844,7 +1075,7 @@ def render_histograms(
                 bins=time_edges,
                 histtype="step",
                 color=black,
-                linewidth=1.45,
+                linewidth=0.9,
                 label="Total",
                 zorder=5,
             )
@@ -973,7 +1204,7 @@ def render_histograms(
         for compute_index, (label, samples_family, phase_colors) in enumerate(
             compute_rows
         ):
-            cumulative_ax = fig.add_subplot(outer[1, compute_index + 2])
+            cumulative_ax = fig.add_subplot(outer[2, compute_index])
             plot_compute_cumulative(
                 cumulative_ax,
                 samples_family,
@@ -983,7 +1214,7 @@ def render_histograms(
             )
 
         mlp_correlation_ax = fig.add_subplot(outer[0, 2])
-        attn_correlation_ax = fig.add_subplot(outer[0, 3])
+        attn_correlation_ax = fig.add_subplot(outer[1, 2])
         plot_utc_start_correlation(
             mlp_correlation_ax,
             mlp_combine_samples,
@@ -996,10 +1227,26 @@ def render_histograms(
             attn_correlation_ax,
             attn_dispatch_samples,
             letters[7],
-            "Attention Forward",
+            "Attn + Router compute+comm",
             "Dispatch",
             "#C77A53",
+            "Attn+Router C+C",
         )
+        overlay_utc_start_correlation(
+            attn_correlation_ax,
+            attn_only_dispatch_samples,
+            "Attention only",
+            "Dispatch",
+            "#244A7C",
+        )
+        predispatch_ax = fig.add_subplot(outer[2, 2])
+        plot_predispatch_kernel_cumulative(
+            predispatch_ax,
+            predispatch_samples,
+            letters[8],
+        )
+        for panel_ax in fig.axes:
+            panel_ax.set_box_aspect(1)
 
         path = Path(out)
         if path.suffix.lower() != ".png":
@@ -1193,7 +1440,6 @@ def print_mlp_report(
         )
 
 
-
 def _build_compute_diagnostic_samples(
     per_rank: dict[int, dict[str, list[MlpInstance]]],
     ep: int,
@@ -1220,16 +1466,10 @@ def _build_compute_diagnostic_samples(
                     grouped[instance.step].append(instance)
                 per_rank_step[rank] = grouped
             steps = sorted(
-                {
-                    step
-                    for grouped in per_rank_step.values()
-                    for step in grouped
-                }
+                {step for grouped in per_rank_step.values() for step in grouped}
             )
             for step in steps:
-                rank_items = {
-                    rank: per_rank_step[rank].get(step, []) for rank in ranks
-                }
+                rank_items = {rank: per_rank_step[rank].get(step, []) for rank in ranks}
                 counts = {rank: len(items) for rank, items in rank_items.items()}
                 max_count = max(counts.values(), default=0)
                 complete = []
@@ -1246,9 +1486,7 @@ def _build_compute_diagnostic_samples(
                         continue
                     fastest = min(spans)
                     slowest = max(spans)
-                    complete.append(
-                        (occurrence, fastest, slowest, slowest - fastest)
-                    )
+                    complete.append((occurrence, fastest, slowest, slowest - fastest))
                 samples[phase][gid][step] = complete
                 count_text = ", ".join(f"r{rank}={counts[rank]}" for rank in ranks)
                 print(
@@ -1279,9 +1517,7 @@ def build_mlp_diagnostic_samples(
 
 
 def _flatten_compute_phase(
-    samples: dict[
-        str, dict[int, dict[int, list[tuple[int, int, int, int]]]]
-    ],
+    samples: dict[str, dict[int, dict[int, list[tuple[int, int, int, int]]]]],
     phase: str,
 ) -> list[tuple[int, int, int, int]]:
     """Concatenate all retained steps in chronological occurrence order."""
@@ -1300,6 +1536,7 @@ def plot_utc_start_correlation(
     source_label: str,
     target_label: str,
     color: str,
+    series_label: str | None = None,
 ) -> None:
     """Plot compute-duration skew against UTC-aligned communication-start skew."""
     import numpy as np
@@ -1316,10 +1553,22 @@ def plot_utc_start_correlation(
 
     x = np.asarray([sample.source_duration_skew_ns for sample in samples]) / 1e3
     y = np.asarray([sample.target_start_skew_ns for sample in samples]) / 1e3
-    x_cap = float(np.percentile(x, CDF_DISPLAY_PERCENTILE))
-    y_cap = float(np.percentile(y, CDF_DISPLAY_PERCENTILE))
-    visible = (x <= x_cap) & (y <= y_cap)
+    axis_cap = max(
+        1.0, float(np.percentile(np.maximum(x, y), CORRELATION_DISPLAY_PERCENTILE))
+    )
+    visible = (x <= axis_cap) & (y <= axis_cap)
     xv, yv = x[visible], y[visible]
+    x_outliers = x > axis_cap
+    y_outliers = y > axis_cap
+    hidden_count = int(np.count_nonzero(~visible))
+    print(
+        f"  {source_label} -> {target_label}: hidden outliers="
+        f"{hidden_count}/{len(x)} (x>{axis_cap:.1f} us: "
+        f"{int(np.count_nonzero(x_outliers))}, y>{axis_cap:.1f} us: "
+        f"{int(np.count_nonzero(y_outliers))}, both: "
+        f"{int(np.count_nonzero(x_outliers & y_outliers))})",
+        file=sys.stderr,
+    )
 
     def average_ranks(values):
         order = np.argsort(values, kind="mergesort")
@@ -1353,9 +1602,11 @@ def plot_utc_start_correlation(
         alpha=0.34,
         linewidths=0,
         rasterized=True,
-        label=f"rho={rho:.2f}, slope={slope:.2f}, n={len(xv):,}",
+        label=(
+            (f"{series_label}: " if series_label else "")
+            + f"rho={rho:.2f}, slope={slope:.2f}, n={len(xv):,}"
+        ),
     )
-    axis_cap = max(1.0, x_cap, y_cap)
     ax.plot(
         (0, axis_cap),
         (0, axis_cap),
@@ -1382,7 +1633,10 @@ def plot_utc_start_correlation(
     ax.text(
         0.99,
         0.03,
-        f"Shared axes capped at max P{CDF_DISPLAY_PERCENTILE:g}; UTC aligned",
+        (
+            f"shared P{CORRELATION_DISPLAY_PERCENTILE:g} cap={axis_cap:.1f} us; "
+            f"hidden {hidden_count}/{len(x)}; UTC aligned"
+        ),
         transform=ax.transAxes,
         ha="right",
         va="bottom",
@@ -1392,11 +1646,212 @@ def plot_utc_start_correlation(
     ax.legend(frameon=False, loc="upper left", ncol=1)
 
 
+def overlay_utc_start_correlation(
+    ax,
+    samples: list[ComputeCommSample],
+    source_label: str,
+    target_label: str,
+    color: str,
+) -> None:
+    """Overlay a second duration-skew series on an existing correlation panel."""
+    import numpy as np
+
+    if not samples:
+        return
+    x = np.asarray([sample.source_duration_skew_ns for sample in samples]) / 1e3
+    y = np.asarray([sample.target_start_skew_ns for sample in samples]) / 1e3
+    axis_cap = ax.get_xlim()[1]
+    visible = (x <= axis_cap) & (y <= axis_cap)
+    xv, yv = x[visible], y[visible]
+
+    def average_ranks(values):
+        unique, inverse, counts = np.unique(
+            values, return_inverse=True, return_counts=True
+        )
+        del unique
+        starts = np.cumsum(np.r_[0, counts[:-1]])
+        return starts[inverse] + (counts[inverse] - 1) / 2
+
+    rho = (
+        float(np.corrcoef(average_ranks(xv), average_ranks(yv))[0, 1])
+        if len(xv) >= 2 and np.ptp(xv) > 0 and np.ptp(yv) > 0
+        else float("nan")
+    )
+    slope = (
+        float(np.polyfit(xv, yv, 1)[0])
+        if len(xv) >= 2 and np.ptp(xv) > 0
+        else float("nan")
+    )
+    ax.scatter(
+        xv,
+        yv,
+        s=10,
+        marker="^",
+        color=color,
+        alpha=0.38,
+        linewidths=0,
+        rasterized=True,
+        label=f"{source_label}: rho={rho:.2f}, slope={slope:.2f}, n={len(xv):,}",
+    )
+    hidden_count = int(np.count_nonzero(~visible))
+    print(
+        f"  {source_label} -> {target_label}: hidden outliers="
+        f"{hidden_count}/{len(x)} under shared cap={axis_cap:.1f} us",
+        file=sys.stderr,
+    )
+    ax.set_xlabel("Duration skew (us)")
+    ax.set_title(
+        f"(h) Attention/Router duration vs {target_label} start",
+        loc="left",
+        fontweight="bold",
+        pad=5,
+    )
+    for note in ax.texts:
+        if note.get_text().startswith("shared P"):
+            note.set_text(
+                note.get_text() + f"\n{source_label} hidden {hidden_count}/{len(x)}"
+            )
+            break
+    ax.legend(frameon=False, loc="upper left", ncol=1)
+
+
+def plot_predispatch_kernel_cumulative(
+    ax, samples: list[PredispatchKernelSample], letter: str
+) -> None:
+    """Plot EP-rank skew of compute, communication, and idle time."""
+    import numpy as np
+
+    if not samples:
+        ax.text(0.5, 0.5, "No Router/Preprocess kernel-time samples", ha="center")
+        ax.set_axis_off()
+        return
+
+    floor = np.asarray([sample.floor_ns for sample in samples]) / 1e3
+    maximum = np.asarray([sample.maximum_ns for sample in samples]) / 1e3
+    skew = np.asarray([sample.skew_ns for sample in samples]) / 1e3
+    comm_floor = np.asarray([sample.comm_floor_ns for sample in samples]) / 1e3
+    comm_maximum = np.asarray([sample.comm_maximum_ns for sample in samples]) / 1e3
+    comm_skew = np.asarray([sample.comm_skew_ns for sample in samples]) / 1e3
+    idle_floor = np.asarray([sample.idle_floor_ns for sample in samples]) / 1e3
+    idle_maximum = np.asarray([sample.idle_maximum_ns for sample in samples]) / 1e3
+    idle_skew = np.asarray([sample.idle_skew_ns for sample in samples]) / 1e3
+    kernel_curve = np.sort(skew)
+    comm_curve = np.sort(comm_skew)
+    idle_curve = np.sort(idle_skew)
+    has_comm = bool(np.any(comm_maximum > 0))
+    percentile = np.arange(1, len(kernel_curve) + 1) / len(kernel_curve) * 100
+    ax.step(
+        kernel_curve,
+        percentile,
+        where="post",
+        color="#C77A53",
+        linewidth=1.2,
+        label="Compute Σkernel",
+    )
+    if has_comm:
+        ax.step(
+            comm_curve,
+            percentile,
+            where="post",
+            color="#75AF83",
+            linewidth=1.2,
+            label="Communication",
+        )
+    ax.step(
+        idle_curve,
+        percentile,
+        where="post",
+        color="#4F81BD",
+        linewidth=1.2,
+        label="Idle",
+    )
+
+    x_cap = max(
+        1.0,
+        float(
+            max(
+                np.percentile(kernel_curve, CDF_DISPLAY_PERCENTILE),
+                np.percentile(comm_curve, CDF_DISPLAY_PERCENTILE) if has_comm else 0,
+                np.percentile(idle_curve, CDF_DISPLAY_PERCENTILE),
+            )
+        ),
+    )
+    skew_p50, skew_p90, skew_p99 = np.percentile(skew, (50, 90, 99))
+    comm_p50, comm_p90, comm_p99 = np.percentile(comm_skew, (50, 90, 99))
+    idle_p50, idle_p90, idle_p99 = np.percentile(idle_skew, (50, 90, 99))
+    negative_idle_samples = sum(sample.idle_floor_ns < 0 for sample in samples)
+    comm_sample_count = int(np.count_nonzero(comm_maximum > 0))
+    print(
+        "  Router/Preprocess compute kernel time (communication excluded): "
+        f"n={len(samples)}, fastest-rank P50={np.percentile(floor, 50):.1f} us, "
+        f"slowest-rank P50={np.percentile(maximum, 50):.1f} us, "
+        f"skew P50/P90/P99/max={skew_p50:.1f}/{skew_p90:.1f}/"
+        f"{skew_p99:.1f}/{np.max(skew):.1f} us",
+        file=sys.stderr,
+    )
+    if has_comm:
+        print(
+            "  Router/Preprocess communication kernel time: "
+            f"calls-with-comm={comm_sample_count}/{len(samples)}, "
+            f"min-rank P50={np.percentile(comm_floor, 50):.1f} us, "
+            f"max-rank P50={np.percentile(comm_maximum, 50):.1f} us, "
+            f"skew P50/P90/P99/max={comm_p50:.1f}/{comm_p90:.1f}/"
+            f"{comm_p99:.1f}/{np.max(comm_skew):.1f} us",
+            file=sys.stderr,
+        )
+    print(
+        "  Router/Preprocess idle time (last end - first start - sum): "
+        f"n={len(samples)}, min-rank P50={np.percentile(idle_floor, 50):.1f} us, "
+        f"max-rank P50={np.percentile(idle_maximum, 50):.1f} us, "
+        f"skew P50/P90/P99/max={idle_p50:.1f}/{idle_p90:.1f}/"
+        f"{idle_p99:.1f}/{np.max(idle_skew):.1f} us, "
+        f"negative-idle samples={negative_idle_samples}",
+        file=sys.stderr,
+    )
+
+    ax.set_xlim(0, x_cap)
+    ax.set_ylim(0, 100)
+    ax.set_yticks((0, 25, 50, 75, 100))
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.tick_params(direction="in", length=3, width=0.7)
+    ax.grid(color="#D8D8D8", linewidth=0.45, alpha=0.7)
+    ax.set_xlabel("Cross-rank skew (us)")
+    ax.set_ylabel("Cumulative calls (%)")
+    ax.set_title(
+        f"({letter}) Router/Preprocess cumulative",
+        loc="left",
+        fontweight="bold",
+        pad=5,
+    )
+    ax.text(
+        0.98,
+        0.04,
+        (
+            f"X capped at shared P{CDF_DISPLAY_PERCENTILE:g}; n={len(samples):,}\n"
+            f"Σ kernel skew P50/P90/P99={skew_p50:.1f}/{skew_p90:.1f}/"
+            f"{skew_p99:.1f} us\n"
+            f"Idle skew P50/P90/P99={idle_p50:.1f}/{idle_p90:.1f}/"
+            f"{idle_p99:.1f} us"
+        ),
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=6.5,
+        color="#555555",
+    )
+    ax.legend(
+        frameon=False,
+        ncol=2,
+        loc="upper left",
+        handlelength=1.4,
+        labelspacing=0.25,
+    )
+
+
 def plot_compute_cumulative(
     ax,
-    samples: dict[
-        str, dict[int, dict[int, list[tuple[int, int, int, int]]]]
-    ],
+    samples: dict[str, dict[int, dict[int, list[tuple[int, int, int, int]]]]],
     phase_colors: dict[str, str],
     letter: str,
     title_prefix: str,
@@ -1423,8 +1878,7 @@ def plot_compute_cumulative(
 
     if curves:
         x_hi = max(
-            float(np.percentile(curve, CDF_DISPLAY_PERCENTILE))
-            for curve in curves
+            float(np.percentile(curve, CDF_DISPLAY_PERCENTILE)) for curve in curves
         )
         ax.set_xlim(0, max(1.0, x_hi))
     ax.set_ylim(0, 100)
@@ -1805,6 +2259,7 @@ def parse_args() -> argparse.Namespace:
         help="parallel rank-loading processes (default min(8, cpu)); 1 = serial",
     )
     return p.parse_args()
+
 
 if __name__ == "__main__":
     args = parse_args()
